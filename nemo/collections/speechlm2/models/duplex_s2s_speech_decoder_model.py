@@ -399,13 +399,13 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         if self.cfg.get("pretrained_eou_from_s2s", None):
             self.init_eou_from_another_s2s_checkpoint(self.cfg.pretrained_eou_from_s2s)
 
-        self.embed_audio_tokens = torch.nn.ModuleList(
-            [
-                torch.nn.Embedding(self.speech_vocab_size, self.embed_tokens.embedding_dim)
-                for _ in range(self._num_codebooks)
-            ]
-        )
-        self.audio_head = torch.nn.Linear(self.llm.config.hidden_size, self.speech_vocab_size * self._num_codebooks)
+        # self.embed_audio_tokens = torch.nn.ModuleList(
+        #     [
+        #         torch.nn.Embedding(self.speech_vocab_size, self.embed_tokens.embedding_dim)
+        #         for _ in range(self._num_codebooks)
+        #     ]
+        # )
+        # self.audio_head = torch.nn.Linear(self.llm.config.hidden_size, self.speech_vocab_size * self._num_codebooks)
 
         # cached for quicker audio decoding
         self.register_buffer(
@@ -744,12 +744,12 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
 
         if self.cfg.get('use_old_noise_aug', None):
             # ToDo we are applying it in all datasets, old codebase does not applied in real conv data
-            noise_prob = 0.99
-            noise_min_snr = 20
+            noise_prob = 0.95
+            noise_min_snr = 25
             noise_max_snr = 50
             noise_path = self.cfg.get(
                 'old_noise_aug_path',
-                "/lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data/duplex/dns5/dns5_demand_noise/",
+                "/lustre/fsw/portfolios/convai/projects/convai_convaird_nemo-speech/data/duplex/dns5-full/dns5_demand_noise_night/",
             )
             noise_path_name = "*"
             no_noise_audio = batch["source_audio"].clone()
@@ -1708,12 +1708,14 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             dist.all_reduce(T_tensor, op=dist.ReduceOp.MAX)
             T = int(T_tensor.item())
             if T > T_local:
-                last_frame = source_encoded[:, T_local - 1 : T_local, :]  # (B,1,H)
-                pad = last_frame.repeat(1, T - T_local, 1)  # (B, T-T_local, H)
-                source_encoded = torch.cat([source_encoded, pad], dim=1)
-                asr_emb = torch.cat([asr_emb, pad], dim=1)
-                if self.cfg.get("use_eou_decoder", None):
-                    eou_emb = torch.cat([eou_emb, pad], dim=1)
+
+                last_frame_source = source_encoded[:, T_local - 1: T_local, :]
+                pad_source = last_frame_source.repeat(1, T - T_local, 1)
+                source_encoded = torch.cat([source_encoded, pad_source], dim=1)
+
+                last_frame_asr = asr_emb[:, T_local - 1: T_local, :]
+                pad_asr = last_frame_asr.repeat(1, T - T_local, 1)
+                asr_emb = torch.cat([asr_emb, pad_asr], dim=1)
         else:
             T = T_local
 
