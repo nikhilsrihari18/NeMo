@@ -119,6 +119,10 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
             cuts.resample(self.target_sample_rate), roles=self.output_roles, recording_field="target_audio"
         )
 
+        metadata = []
+        for id, cut in enumerate(cuts):
+            metadata.append({'audio_filepath': cut.id + '.wav'})
+            
         return {
             "sample_id": [str(cut.id) for cut in cuts],
             "source_audio": source_audio,
@@ -135,6 +139,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
             "target_first_turn_audio": target_first_turn_audio,
             "target_first_turn_audio_lens": target_first_turn_audio_lens,
             "formatter": [getattr(cut, "formatter", "s2s_duplex") for cut in cuts],
+            "metadata": metadata,
         }
 
 

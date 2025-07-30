@@ -24,8 +24,10 @@ from nemo.utils.trainer_utils import resolve_trainer_cfg
 
 torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
 
+# DEBUGGING
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"  # Ensure CUDA operations are synchronous for debugging.
 
-@hydra_runner(config_path="conf", config_name="s2s_duplex_speech_decoder")
+@hydra_runner(config_path="./", config_name="qwen_1b_70_0_infer_voicebench")
 def inference(cfg):
     OmegaConf.resolve(cfg)
     torch.distributed.init_process_group(backend="nccl")

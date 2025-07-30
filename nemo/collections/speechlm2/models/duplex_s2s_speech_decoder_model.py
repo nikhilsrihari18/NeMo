@@ -38,13 +38,14 @@ from transformers import DynamicCache
 from nemo.collections.audio.parts.utils.resampling import resample
 from nemo.collections.common.tokenizers import AutoTokenizer
 from nemo.collections.nlp.parts.nlp_overrides import NLPSaveRestoreConnector
-from nemo.collections.speechlm2.data.utils import get_pad_id
+from nemo.collections.speechlm2.data.utils import get_pad_id, deduplicate_results
 from nemo.collections.speechlm2.models.duplex_s2s_model import replace_control_speech_codes, tokens_to_str
 from nemo.collections.speechlm2.modules import TransformerARSpeechDecoder
 from nemo.collections.speechlm2.parts.hf_hub import HFHubMixin
 from nemo.collections.speechlm2.parts.lora import maybe_install_lora
 from nemo.collections.speechlm2.parts.metrics.asr_bleu import ASRBLEU
 from nemo.collections.speechlm2.parts.metrics.bleu import BLEU
+from nemo.collections.speechlm2.parts.metrics.mos import MOS
 from nemo.collections.speechlm2.parts.metrics.results_logger import ResultsLogger
 from nemo.collections.speechlm2.parts.metrics.token_accuracy import TokenAccuracy
 from nemo.collections.speechlm2.parts.optim_setup import configure_optimizers, is_frozen
@@ -57,7 +58,11 @@ from nemo.collections.speechlm2.parts.pretrained import (
 )
 from nemo.core.neural_types import AudioSignal, LabelsType, LengthsType, NeuralType
 from nemo.utils import logging
-
+import os
+import torchaudio
+import json
+from collections import defaultdict
+from torch.nn.utils.rnn import pad_sequence
 
 def delay_eos(tokens, eos_token_id, pad_token_id, shift=10):
     """
@@ -206,8 +211,12 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             "_control_codes",
             torch.tensor([self.speech_bos_id, self.speech_eos_id, self.speech_delay_id], device=self.device),
         )
-        self._use_fsdp = False
+        self._use_fsdp = self.cfg.get("use_fsdp", False)
         self._use_tp = False
+        # Storage for collecting validation results across GPUs
+        self.validation_results = defaultdict(list)
+        self.use_silence_tokens = self.cfg.get("use_silence_tokens", False)
+        
 
     def init_speech_generation_from_tts_checkpoint(self, checkpoint_path):
         if checkpoint_path is not None:
@@ -910,6 +919,10 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
 
         self.asr_bleu = ASRBLEU(self.cfg.scoring_asr).reset()
         self.bleu = BLEU().reset()
+        # This mos evaluation is relied on UTMOSv2,
+        # it is not very accurate since generated audio contains long silence segments.
+        self.mos = MOS().reset()
+        
         tolerance = int(
             self.cfg.get("val_acc_tolerance", 160) / (1000 / self.target_fps)
         )  # 160 ms as default tolerance --> 2 tokens for 12.5FPS and 1 for 25FPS
@@ -919,6 +932,73 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         self.text_eos_acc = TokenAccuracy(
             token_name="text_eos", token_id=self.text_eos_id, tolerance=tolerance
         ).reset()
+        
+    def save_validation_results_as_json(self, prefix="val"):
+        """
+        Save validation results as JSON files, gathering from all GPUs but writing only from GPU 0.
+              
+        Files are saved in JSONL format (one JSON object per line) in the following structure:
+        - {prefix}_all_results.jsonl: All results combined
+        - {prefix}_{dataset_name}_results.jsonl: Results per dataset
+        
+        Args:
+            prefix (str): Prefix for the output files (default: "val" for validation, "test" for testing)
+        """
+        if not self.validation_results:
+            return
+            
+        # Gather results from all GPUs
+        all_results = {}
+        for name, results in self.validation_results.items():
+            # Convert results to a format that can be gathered
+            if dist.is_initialized():
+                gathered_results = [None] * dist.get_world_size()
+                dist.all_gather_object(gathered_results, results)
+                
+                # Combine results from all GPUs
+                combined_results = []
+                for gpu_results in gathered_results:
+                    if gpu_results is not None:
+                        combined_results.extend(gpu_results)
+            else:
+                # Single GPU case
+                combined_results = results
+            
+            all_results[name] = combined_results
+        
+        # Save JSON files only from GPU 0
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            save_dir = self.cfg.get("json_save_path", None)
+            if save_dir is None:
+                save_dir = os.path.join(self.trainer.log_dir, f"{prefix}_results")
+            
+            os.makedirs(save_dir, exist_ok=True)
+            
+            # Deduplicate results before saving
+            # Lhotse can produce duplicate samples during distributed inference (see:
+            # https://github.com/lhotse-speech/lhotse/blob/fda1a986e5e1e72a14c82049b4ee709fc09a81e6/lhotse/dataset/sampling/base.py#L349)
+            # We remove duplicates where the prefix before '_dup' exists in the dataset
+            for name, results in all_results.items():
+                all_results[name] = deduplicate_results(results)
+            
+            # Save combined results
+            combined_file = os.path.join(save_dir, f"{prefix}_all_results.jsonl")
+            with open(combined_file, 'w', encoding='utf-8') as f:
+                for name, results in all_results.items():
+                    for result in results:
+                        f.write(json.dumps(result, ensure_ascii=False) + '\n')
+            
+            # Save per-dataset results
+            for name, results in all_results.items():
+                dataset_file = os.path.join(save_dir, f"{prefix}_{name}_results.jsonl")
+                with open(dataset_file, 'w', encoding='utf-8') as f:
+                    for result in results:
+                        f.write(json.dumps(result, ensure_ascii=False) + '\n')
+            
+            logging.info(f"Validation results saved to {save_dir}")
+        
+        # Clear the results for next epoch
+        self.validation_results.clear()
 
     def on_validation_epoch_end(self, prefix="val") -> None:
         asr_bleu = self.asr_bleu.compute()
@@ -933,6 +1013,25 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         text_eos_acc = self.text_eos_acc.compute()
         for k, m in text_eos_acc.items():
             self.log(f"{prefix}_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
+        
+        mos = self.mos.compute()
+        for k, m in mos.items():
+            self.log(f"{prefix}_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
+        
+        # Save validation results as JSON
+        self.save_validation_results_as_json(prefix=prefix)
+        
+    def transcribe_audio(self, audio, audio_lens):
+        if audio_lens is None:
+            audio_lens = [audio.shape[1]] * audio.shape[0]
+        
+        hyps = self.asr_bleu.asr.transcribe(
+            [aud[:alen] for aud, alen in zip(audio, audio_lens)],
+            batch_size=audio.shape[0],
+            verbose=False,
+        )
+        hyps = [hyp.text for hyp in hyps]
+        return hyps
 
     def validation_step(self, batch: dict, batch_idx: int):
 
@@ -945,20 +1044,27 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         for name, dataset_batch in batch.items():
             if dataset_batch is None:
                 continue  # some dataset is exhausted
-
+            
+            metadata = dataset_batch.get('metadata', [{}] * len(dataset_batch['target_texts']))
+            
             results = self.offline_inference(
                 dataset_batch["source_audio"],
                 dataset_batch["source_audio_lens"],
             )
-
+            
             with fp32_precision():  # resample is fragile to bfloat16 default dtype
-                asr_hyps = self.asr_bleu.update(
+                pred_audios = resample(results["audio"], 22050, 16000)
+                asr_hyps = self.transcribe_audio(results["audio"], results["audio_len"])
+                target_audio_hyps = self.transcribe_audio(
+                    dataset_batch["target_audio"], dataset_batch["target_audio_lens"])
+               
+                self.asr_bleu.update_v2(
                     name=name,
                     refs=dataset_batch["target_texts"],
-                    pred_audio=resample(results["audio"], 22050, 16000),
+                    pred_audio=pred_audios,
                     pred_audio_lens=(results["audio_len"] / 22050 * 16000).to(torch.long),
+                    asr_hyps=asr_hyps
                 )
-
                 self.results_logger.update(
                     name=name,
                     refs=dataset_batch["target_texts"],
@@ -977,6 +1083,83 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             self.bleu.update(name=name, refs=dataset_batch["target_texts"], hyps=results["text"])
             self.text_bos_acc.update(name=name, refs=dataset_batch["target_tokens"], hyps=results["tokens_text"])
             self.text_eos_acc.update(name=name, refs=dataset_batch["target_tokens"], hyps=results["tokens_text"])
+            
+            self.mos.update(
+                name=name,
+                pred_audios=pred_audios,
+                tmp_dir=os.path.join(self.cfg.get('audio_save_path'), "tmp"),
+            )
+            # TODO: this is redundant with ResultsLogger, but we keep it for now as Viet
+            # saves audio in a different way (_user.wav, _pred.wav, _target.wav)
+            if self.cfg.get('audio_save_path') is not None:
+                self.save_predicted_audio_stereo(pred_audios, dataset_batch, name)
+                
+            # Collect results for JSON saving (Viet's code)
+            for i in range(len(dataset_batch["target_texts"])):
+                result_entry = {
+                    "text": dataset_batch["target_texts"][i],
+                    "pred_text": results["text"][i],
+                    "speech_preds_transcribed": asr_hyps[i],
+                    "speech_answers_transcribed": target_audio_hyps[i],
+                    "sample_id": dataset_batch["sample_id"][i] if "sample_id" in dataset_batch else i,
+                    "dataset_name": name,
+                    "audio_filepath": metadata[i]['audio_filepath']
+                }
+                if 'instructions' in dataset_batch and dataset_batch['instructions'] is not None:
+                    result_entry['sys_prompt'] = dataset_batch['instructions_raw_text'][i]
+                    result_entry['call_response'] = dataset_batch['call_responses_raw_text'][i]
+                self.validation_results[name].append(result_entry)
+                
+    def save_predicted_audio_stereo(self, pred_audios, dataset_batch, name):
+        """Probably not needed as taken care by ResultsLogger !!!"""
+        save_path = os.path.join(self.cfg.get('audio_save_path'), name)
+        os.makedirs(save_path, exist_ok=True)
+
+        for i in range(len(pred_audios)):
+
+            pred_audio = pred_audios[i]
+            user_audio = dataset_batch["source_audio"][i]
+            target_audio = dataset_batch["target_audio"][i]
+
+            T1 = pred_audio.shape[0]
+            T2 = user_audio.shape[0]
+            T3 = target_audio.shape[0]
+            max_len = max(T1, T2, T3)
+
+            pred_audio_padded = torch.nn.functional.pad(pred_audio, (0, max_len - T1), mode='constant', value=0)
+            user_audio_padded = torch.nn.functional.pad(user_audio, (0, max_len - T2), mode='constant', value=0)
+            target_audio_padded = torch.nn.functional.pad(target_audio, (0, max_len - T3), mode='constant', value=0)
+            stereo_audio = torch.stack([user_audio_padded, pred_audio_padded], dim=0)
+
+            sample_id = dataset_batch['sample_id'][i]
+            if not sample_id:
+                sample_id = dataset_batch['target_texts'][i][:15].replace(" ", "_")
+
+            save_filename = os.path.join(save_path, f"{sample_id}.wav")
+            save_filename_user = os.path.join(save_path, f"{sample_id}_user.wav")
+            save_filename_pred = os.path.join(save_path, f"{sample_id}_pred.wav")
+            save_filename_target = os.path.join(save_path, f"{sample_id}_target.wav")
+            torchaudio.save(
+                save_filename,
+                stereo_audio.float().cpu(),
+                16000
+            )
+            
+            torchaudio.save(
+                save_filename_user,
+                user_audio_padded.unsqueeze(0).float().cpu(),
+                16000
+            )
+            torchaudio.save(
+                save_filename_pred,
+                pred_audio_padded.unsqueeze(0).float().cpu(),
+                16000
+            )
+            torchaudio.save(
+                save_filename_target,
+                target_audio_padded.unsqueeze(0).float().cpu(),
+                16000
+            )
 
     def on_test_epoch_start(self) -> None:
         return self.on_validation_epoch_start()

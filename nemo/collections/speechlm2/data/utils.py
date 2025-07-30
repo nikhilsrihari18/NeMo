@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import warnings
-
+import re
 
 def get_pad_id(tokenizer) -> int:
     pad_id = tokenizer.pad
@@ -25,3 +25,31 @@ def get_pad_id(tokenizer) -> int:
         "The text tokenizer has no <pad> or <unk> tokens available, using ID 0 for padding (this may lead to silent bugs)."
     )
     return 0
+
+
+def is_duplicate_sample_id(sample_id):
+    """Check if sample_id is a duplicate (contains '_dup' pattern)."""
+    return re.search(r"^.+_dup\d+", sample_id) is not None
+
+def deduplicate_results(results):
+    """Remove duplicate results where the prefix exists in the dataset."""
+    if not results:
+        return results
+    
+    # Collect all sample_ids
+    sample_ids = set()
+    for result in results:
+        sample_id = result.get('sample_id', '')
+        sample_ids.add(sample_id)
+    
+    # Filter out duplicates
+    filtered_results = []
+    for result in results:
+        sample_id = result.get('sample_id', '')
+        if is_duplicate_sample_id(sample_id):
+            prefix = sample_id.split('_dup')[0]
+            if prefix in sample_ids:
+                continue  # Remove this duplicate
+        filtered_results.append(result)
+    
+    return filtered_results
