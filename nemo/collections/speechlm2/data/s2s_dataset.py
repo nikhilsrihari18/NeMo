@@ -23,7 +23,7 @@ from lhotse.dataset.collation import collate_audio, collate_vectors
 from lhotse.utils import ifnone
 
 from nemo.collections.common.tokenizers import TokenizerSpec
-from nemo.collections.speechlm2.data.utils import get_pad_id
+from nemo.collections.speechlm2.data.utils import get_pad_id, collate_and_pad_1d, collate_and_pad_2d, collate_and_pad
 from nemo.utils import logging
 
 
