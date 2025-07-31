@@ -1054,7 +1054,6 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
 
             # Get ASR hypotheses for the generated audio
             # torchaudio resample is fragile to bfloat16 default dtype as well
-            """
             with fp32_precision():  # resample is fragile to bfloat16 default dtype
                 asr_hyps = self.asr_bleu.update(
                     name=name,
@@ -1081,6 +1080,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             self.bleu.update(name=name, refs=dataset_batch["target_texts"], hyps=results["text"])
             self.text_bos_acc.update(name=name, refs=dataset_batch["target_tokens"], hyps=results["tokens_text"])
             self.text_eos_acc.update(name=name, refs=dataset_batch["target_tokens"], hyps=results["tokens_text"])
+            
             """
             with fp32_precision():  # torchaudio resample is fragile to bfloat16 default dtype as well
               
@@ -1112,6 +1112,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             )
 
             self.bleu.update(name=name, refs=dataset_batch["target_texts"], hyps=results["text"])
+            """
 
     def on_test_epoch_start(self) -> None:
         return self.on_validation_epoch_start()
