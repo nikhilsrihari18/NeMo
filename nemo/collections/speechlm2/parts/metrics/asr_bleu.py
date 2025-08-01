@@ -81,22 +81,6 @@ class ASRBLEU:
             asr_hyps_texts.append(asr_hyp)
 
         return asr_hyps_texts
-        
-    def update_v2(
-        self, name: str, refs: list[str], pred_audio: torch.Tensor, pred_audio_lens: torch.Tensor = None, asr_hyps: list[str] = None
-    ) -> None:
-        if self.asr is None:
-            self.reset()
-
-        if pred_audio_lens is None:
-            pred_audio_lens = [pred_audio.shape[1]] * pred_audio.shape[0]
-
-        for ref, asr_hyp in zip(refs, asr_hyps):
-            self._refs[name].append(self.normalizer(ref))
-            self._hyps[name].append(self.normalizer(asr_hyp))
-            if self.verbose:
-                asrb = sacrebleu.sentence_bleu(asr_hyp, [ref]).score
-                logging.info(f"[REF]\t{ref}\n[ASR]\t{asr_hyp} [{asrb:.2f}]")
 
     def compute(self) -> dict[str, torch.Tensor]:
         """Computes the final score and deallocates ASR and partial results."""

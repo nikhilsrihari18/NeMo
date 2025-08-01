@@ -1077,23 +1077,12 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                     tokenizer=self.tokenizer,
                 )
 
-            self.bleu.update(name=name, refs=dataset_batch["target_texts"], hyps=results["text"])
-            self.text_bos_acc.update(name=name, refs=dataset_batch["target_tokens"], hyps=results["tokens_text"])
-            self.text_eos_acc.update(name=name, refs=dataset_batch["target_tokens"], hyps=results["tokens_text"])
-            
-            """
-            with fp32_precision():  # torchaudio resample is fragile to bfloat16 default dtype as well
-              
-                asr_hyps = self.transcribe_audio(results["audio"], results["audio_len"])
-                target_audio_hyps = self.transcribe_audio(dataset_batch["target_audio"], dataset_batch["target_audio_lens"])
-
             # Collect results for JSON saving
             for i in range(len(dataset_batch["target_texts"])):
                 result_entry = {
                     "text": dataset_batch["target_texts"][i],
                     "pred_text": results["text"][i],
                     "speech_preds_transcribed": asr_hyps[i],
-                    "speech_answers_transcribed": target_audio_hyps[i],
                     "sample_id": dataset_batch["sample_id"][i] if "sample_id" in dataset_batch else i,
                     "dataset_name": name,
                     "audio_filepath": metadata[i]['audio_filepath']
@@ -1103,16 +1092,9 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                     result_entry['call_response'] = dataset_batch['call_responses_raw_text'][i]
                 self.validation_results[name].append(result_entry)
 
-            self.asr_bleu.update_v2(
-                name=name,
-                refs=dataset_batch["target_texts"],
-                pred_audio=pred_audios,
-                pred_audio_lens=(results["audio_len"] / 22050 * 16000).to(torch.long),
-                asr_hyps=asr_hyps
-            )
-
             self.bleu.update(name=name, refs=dataset_batch["target_texts"], hyps=results["text"])
-            """
+            self.text_bos_acc.update(name=name, refs=dataset_batch["target_tokens"], hyps=results["tokens_text"])
+            self.text_eos_acc.update(name=name, refs=dataset_batch["target_tokens"], hyps=results["tokens_text"])
 
     def on_test_epoch_start(self) -> None:
         return self.on_validation_epoch_start()
