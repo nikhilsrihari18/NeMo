@@ -217,7 +217,10 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         self.validation_results = defaultdict(list)
         self.use_silence_tokens = self.cfg.get("use_silence_tokens", False)
         
-
+        # SE testing inference variants
+        self.inference_duration_grace = self.cfg.inference.get("duration_grace", 0)
+        # self.inference_break_on_speech_eos = self.cfg.inference.get("break_on_speech_eos", False)
+        
     def init_speech_generation_from_tts_checkpoint(self, checkpoint_path):
         if checkpoint_path is not None:
             if '.nemo' in checkpoint_path:
@@ -1218,7 +1221,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         if self._use_fsdp:
             T_tensor = torch.tensor([T_local], device=source_encoded.device)
             dist.all_reduce(T_tensor, op=dist.ReduceOp.MAX)
-            T = int(T_tensor.item())
+            T = int(T_tensor.item()) + self.inference_duration_grace   # TODO: not ready
             if T > T_local:
 
                 last_frame_source = source_encoded[:, T_local - 1 : T_local, :]
@@ -1228,8 +1231,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 pad_asr = last_frame_asr.repeat(1, T - T_local, 1)
                 asr_emb = torch.cat([asr_emb, pad_asr], dim=1)
         else:
-            T = T_local
-
+            T = T_local + self.inference_duration_grace  # TODO: not ready
         # Apply channel weight
         input_embeds = source_encoded.clone()
         input_embeds *= self.cfg.get("duplex_user_channel_weight", 1.0)
@@ -1321,7 +1323,9 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                     self.speech_eos_id,
                     gen_audio[:, t],
                 )
-
+                
+        # TODO: trim beyond speech_eos if inference_break_on_speech_eos
+    
         # Trim back to local length if padded
         if self._use_fsdp and T > T_local:
             gen_text = gen_text[:, :T_local]
