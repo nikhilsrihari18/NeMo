@@ -196,6 +196,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         if self.cfg.get("pretrained_tts_from_s2s", None):
             self.init_speech_generation_from_another_s2s_checkpoint(self.cfg.pretrained_tts_from_s2s)
 
+        """
         self.embed_audio_tokens = torch.nn.ModuleList(
             [
                 torch.nn.Embedding(self.speech_vocab_size, self.embed_tokens.embedding_dim)
@@ -203,6 +204,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             ]
         )
         self.audio_head = torch.nn.Linear(self.llm.config.hidden_size, self.speech_vocab_size * self._num_codebooks)
+        """
 
         # cached for quicker audio decoding
         self.register_buffer(
