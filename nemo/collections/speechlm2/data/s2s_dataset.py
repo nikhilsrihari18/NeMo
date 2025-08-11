@@ -23,7 +23,7 @@ from lhotse.dataset.collation import collate_audio, collate_vectors
 from lhotse.utils import ifnone
 
 from nemo.collections.common.tokenizers import TokenizerSpec
-from nemo.collections.speechlm2.data.utils import get_pad_id
+from nemo.collections.speechlm2.data.utils import get_pad_id, collate_and_pad_1d, collate_and_pad_2d, collate_and_pad
 from nemo.utils import logging
 
 
@@ -102,6 +102,12 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         assert tokenizer.eos is not None, "EOS support in the tokenizer is required for S2S models."
 
     def __getitem__(self, cuts: CutSet) -> dict:
+        if getattr(cuts[0], "s2s_duplex_functioncalling", False):
+            return self.__getitem__duplex_fc__(cuts)
+        else:
+            return self.__getitem__duplex__(cuts)
+
+    def __getitem__duplex__(self, cuts: CutSet) -> dict:
         cuts = cuts.transform_text(_strip_timestamps)
 
         source_audio, source_audio_lens = collate_audio(cuts.resample(self.source_sample_rate))
@@ -118,6 +124,9 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         target_first_turn_audio, target_first_turn_audio_lens = collate_first_turn_audio(
             cuts.resample(self.target_sample_rate), roles=self.output_roles, recording_field="target_audio"
         )
+        metadata = []
+        for id, cut in enumerate(cuts):
+            metadata.append({'audio_filepath': cut.id + '.wav'})
 
         return {
             "sample_id": [str(cut.id) for cut in cuts],
@@ -135,6 +144,167 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
             "target_first_turn_audio": target_first_turn_audio,
             "target_first_turn_audio_lens": target_first_turn_audio_lens,
             "formatter": [getattr(cut, "formatter", "s2s_duplex") for cut in cuts],
+            "metadata": metadata,
+        }
+
+    def __getitem__duplex_fc__(self, cuts: CutSet) -> dict:
+        cuts = cuts.transform_text(_strip_timestamps)
+        source_audio, source_audio_lens = collate_audio(cuts.resample(self.source_sample_rate))
+        target_audio, target_audio_lens = collate_audio(
+            cuts.resample(self.target_sample_rate), recording_field="target_audio"
+        )
+        target_tokens, target_token_lens = collate_token_channel_fc(
+            cuts, self.tokenizer, self.frame_length, roles=self.output_roles
+        )
+        source_tokens, source_token_lens = collate_token_channel_fc(
+            cuts, self.tokenizer, self.frame_length, roles=self.input_roles
+        )
+
+        # Handle function calling 
+        metadata = []
+        num_turns = []
+        call_responses, call_responses_lengths = [], []
+        call_responses_times, call_responses_steps = [], []
+        call_responses_raw_text = []
+        instruction_texts, instruction_text_lengths = [], []
+        instruction_raw_text = []
+        
+        def get_step_by_time(text_start_time):
+            text_start_step = (
+                text_start_time
+                * self.codec_sample_rate 
+                / self.codec_model_downsampling_factor
+                // self.decoder_reduction_factor
+            )
+            return int(text_start_step) - 1
+
+        def validate_time(input_time):
+            if input_time > cut.duration + 0.16:
+                logging.info(f"{input_time} > {cut.duration} in {cut}")
+            return min(input_time, cut.duration)
+
+        def get_text_from_segments_fc(segments): #, total_steps):
+            call_responses = []
+            call_response_lengths = []
+            call_response_times = []
+            call_response_steps = []
+            call_responses_raw_text = []
+            for i in range(0, len(segments), 2):
+                pattern = r"<\|\d+\|>"
+                call = segments[i]
+                call_responses_raw_text.append(call.custom['function'])
+                # Check if there's a response (next segment exists)
+                if i + 1 < len(segments):
+                    response = segments[i+1]
+                    call_response_text = " ".join([call.custom['function'], response.custom['function']])             
+                    call_responses_raw_text.append(response.custom['function'])
+                else:
+                    # Only call exists, no response
+                    call_response_text = call.custom['function']
+                output_text = re.sub(pattern, "", call_response_text)
+                output_text = re.sub(r'\s+', ' ', output_text).strip()
+                # The original code is overly complicated, but it essentially converts text to token IDs.
+                #target_text = self.text_processor._process_example(context="", output=output_text)
+                # -1 to remove the eos token added by the text processor
+                #target_text, target_text_length = torch.as_tensor(target_text["answer_ids"][:-1]), torch.as_tensor(
+                #    len(target_text["answer_ids"]) - 1
+                #)
+                target_text = torch.as_tensor(self.tokenizer.text_to_ids(output_text))
+                target_text_length = torch.as_tensor(len(target_text))
+                call_responses.append(target_text)
+                call_response_lengths.append(target_text_length)
+
+                text_start_time = call.start
+                text_start_time = validate_time(text_start_time)
+
+                text_start_step = compute_num_frames(
+                    duration=(text_start_time),
+                    frame_shift=self.frame_length,
+                    sampling_rate=self.target_sample_rate
+                )
+                call_response_times.append(text_start_time)
+                call_response_steps.append(text_start_step)
+            return call_responses, call_response_lengths, call_response_times, call_response_steps, call_responses_raw_text
+
+        def get_text_from_instruction(segment):
+            pattern = r"<\|\d+\|>"
+            output_text = re.sub(pattern, "", segment.text)
+            output_text = re.sub(r'\s+', ' ', output_text).strip()
+            target_text = torch.as_tensor(self.tokenizer.text_to_ids(output_text))
+            target_text_length = torch.as_tensor(len(target_text))
+            return target_text, target_text_length, segment.text
+
+        # iterate over all cut in a batch
+        for id, cut in enumerate(cuts):
+            num_turns.append(len(cut.supervisions) - 1) # 1st supervision is system instruction
+            # [TODO Check]
+            metadata.append({'audio_filepath': cut.id + '.wav'})
+            
+            # Add logging before assertion to debug failures
+            if cut.supervisions[0].speaker != 'system':
+                logging.error(f"Assertion failed: cut.id={cut.id}, first supervision speaker='{cut.supervisions[0].speaker}', expected='system'")
+                logging.error(f"Cut object: {cut}")
+            
+            assert cut.supervisions[0].speaker == 'system'
+            instruction_segment = cut.supervisions[0]
+            
+            if 'function' in cut.supervisions[1].custom:
+                function_segments = [sup for sup in cut.supervisions[1:] if sup.custom['function'] != '']
+            else:
+                function_segments = []
+
+
+            cur_instruction_text, cur_instruction_text_length, cur_instruction_raw_text = get_text_from_instruction(instruction_segment)
+            instruction_texts.append(cur_instruction_text)
+            instruction_text_lengths.append(cur_instruction_text_length)
+            instruction_raw_text.append(cur_instruction_raw_text)
+            if len(function_segments) > 0:
+                cur_call_responses, cur_call_response_lengths, cur_call_response_times, cur_call_response_steps, cur_call_responses_raw_text = get_text_from_segments_fc(function_segments)
+    
+                call_responses.append(collate_and_pad(cur_call_responses, get_pad_id(self.tokenizer))[0])
+                call_responses_lengths.append(cur_call_response_lengths)
+                call_responses_times.append(cur_call_response_times)
+                call_responses_steps.append(cur_call_response_steps)
+                call_responses_raw_text.append(cur_call_responses_raw_text)
+
+        instruction_texts, instruction_text_lengths = collate_and_pad(instruction_texts, get_pad_id(self.tokenizer))
+
+        if len(call_responses) > 0:
+            
+            call_responses = collate_and_pad_2d(call_responses, get_pad_id(self.tokenizer)) # [b, t, l]
+            call_responses_lengths= collate_and_pad_1d(call_responses_lengths) # [b, t]
+            call_responses_times = collate_and_pad_1d(call_responses_times) # [b, t]
+            call_responses_steps = collate_and_pad_1d(call_responses_steps) # [b, t]
+        else:
+            call_responses = None
+            call_responses_lengths = None
+            call_responses_times = None
+            call_responses_steps = None
+        metadata = []
+        for id, cut in enumerate(cuts):
+            metadata.append({'audio_filepath': cut.id + '.wav'})
+        return {
+            "sample_id": [cut.id for cut in cuts],
+            "source_audio": source_audio,
+            "source_audio_lens": source_audio_lens,
+            "target_audio": target_audio,
+            "target_audio_lens": target_audio_lens,
+            "target_tokens": target_tokens,
+            "target_token_lens": target_token_lens,
+            "source_tokens": source_tokens,
+            "source_token_lens": source_token_lens,
+            "target_texts": [
+                " ".join(s.text for s in cut.supervisions if s.speaker in self.output_roles) for cut in cuts
+            ],
+            "call_responses": call_responses,
+            "call_response_lengths": call_responses_lengths,
+            "call_response_times": call_responses_times,
+            "call_response_steps": call_responses_steps,
+            "instructions": instruction_texts, #None,
+            "instructions_len": instruction_text_lengths, #None,
+            "instructions_raw_text": instruction_raw_text,
+            "call_responses_raw_text": call_responses_raw_text,
+            "metadata": metadata,
         }
 
 
@@ -169,6 +339,20 @@ def collate_token_channel(
     tokens = collate_vectors(tokens, padding_value=pad_id)
     return tokens, token_lens
 
+def collate_token_channel_fc(
+    cuts: CutSet,
+    tokenizer: TokenizerSpec,
+    frame_length: Seconds,
+    roles: set[str],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    pad_id = get_pad_id(tokenizer)
+    tokens = [
+        build_token_channel_fc(c, tokenizer=tokenizer, frame_length=frame_length, roles=roles, pad_id=pad_id)
+        for c in cuts
+    ]
+    token_lens = torch.tensor([len(tt) for tt in tokens])
+    tokens = collate_vectors(tokens, padding_value=pad_id)
+    return tokens, token_lens
 
 def build_token_channel(
         cut: Cut,
@@ -240,3 +424,48 @@ def _strip_timestamps(
     # Regexp pattern args are cached compiled patterns (micro-optimization).
     text = _TIMESTAMP_PATTERN.sub("", text)  # strip timestamp tokens if present
     return _SPACE_PATTERN.sub(" ", text).strip()  # strip multi-whitespaces
+
+def build_token_channel_fc(
+    cut: Cut,
+    tokenizer: TokenizerSpec,
+    frame_length: Seconds,
+    roles: set[str],
+    pad_id: int = -1,
+) -> torch.Tensor:
+    diagnostic = f"Extra info: {cut.id=}"
+    if getattr(cut, "shard_origin", None) is not None:
+        diagnostic = f"{diagnostic} {cut.shard_origin=}"
+
+    total = compute_num_frames(cut.duration, frame_length, cut.sampling_rate)
+    tokens = torch.ones(total, dtype=torch.long) * pad_id
+
+    # Skip system supervision (first supervision) and function calling segments
+    for supervision in cut.supervisions[1:]:  # Skip first supervision (system)
+        if supervision.speaker in roles and ('function' not in supervision.custom or supervision.custom['function'] == ''):
+            text_ids = torch.as_tensor([tokenizer.bos] + tokenizer.text_to_ids(supervision.text))
+
+            pos = compute_num_frames(supervision.start, frame_length, cut.sampling_rate)
+            if pos > len(tokens):
+                logging.warning(
+                    f"Ill-constructed example: the beginning offset of a supervision {pos} is larger than the example's length {len(tokens)}. {diagnostic}"
+                )
+                continue
+
+            endpos = pos + len(text_ids)
+            if endpos > len(tokens):
+                trunc_len = len(tokens) - pos
+                logging.warning(
+                    f"Truncating training example's text_ids of length {len(text_ids)} by {trunc_len} because {endpos=} > {len(tokens)=}. {diagnostic}"
+                )
+                text_ids = text_ids[:trunc_len]
+            try:
+                tokens[pos:endpos] = text_ids
+            except Exception as e:
+                raise RuntimeError(f"{tokens.shape=} {pos=} {endpos=} {text_ids.shape=} {diagnostic}") from e
+
+            # Insert EOS at the end of the supervision segment
+            eospos = compute_num_frames(supervision.end, frame_length, cut.sampling_rate)
+            if eospos < len(tokens):  # skip otherwise - unfinished turn
+                tokens[eospos] = tokenizer.eos
+
+    return tokens
