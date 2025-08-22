@@ -25,7 +25,7 @@ from lhotse.utils import ifnone
 from nemo.collections.common.tokenizers import TokenizerSpec
 from nemo.collections.speechlm2.data.utils import get_pad_id, collate_and_pad_1d, collate_and_pad_2d, collate_and_pad
 from nemo.utils import logging
-
+from nemo.collections.common.data.lhotse.text_adapters import Formattable
 
 class DuplexS2SDataset(torch.utils.data.Dataset):
     """
@@ -90,6 +90,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         target_sample_rate: int,
         input_roles: list[str] = None,
         output_roles: list[str] = None,
+        text_max_tokens: int = 10000,
     ):
         self.tokenizer = tokenizer
         self.frame_length = frame_length
@@ -97,43 +98,43 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         self.target_sample_rate = target_sample_rate
         self.input_roles = set(ifnone(input_roles, ["user"]))
         self.output_roles = set(ifnone(output_roles, ["agent"]))
-        
+        self.text_max_tokens = text_max_tokens
+
         assert tokenizer.bos is not None, "BOS support in the tokenizer is required for S2S models."
         assert tokenizer.eos is not None, "EOS support in the tokenizer is required for S2S models."
 
     def __getitem__(self, cuts: CutSet) -> dict:
         if getattr(cuts[0], "s2s_duplex_functioncalling", False):
-            return self.__getitem__duplex_fc__(cuts)
+            return self.__getitem__duplex_functioncalling_(cuts)
+        elif getattr(cuts[0], "t2t", False):
+            return self.__getitem__t2t_(cuts)
+        elif getattr(cuts[0], "s2s_duplex", False):
+            return self.__getitem__duplex__(cuts)
         else:
             return self.__getitem__duplex__(cuts)
 
     def __getitem__duplex__(self, cuts: CutSet) -> dict:
         cuts = cuts.transform_text(_strip_timestamps)
+        is_s2t = getattr(cuts[0], "s2t", False)
 
         source_audio, source_audio_lens = collate_audio(cuts.resample(self.source_sample_rate))
-        target_audio, target_audio_lens = collate_audio(
-            cuts.resample(self.target_sample_rate), recording_field="target_audio"
-        )
         target_tokens, target_token_lens = collate_token_channel(
             cuts, self.tokenizer, self.frame_length, roles=self.output_roles
         )
         source_tokens, source_token_lens = collate_token_channel(
             cuts, self.tokenizer, self.frame_length, roles=self.input_roles
         )
-        # extract target speaker first turn audio to uses for speaker conditioning
-        target_first_turn_audio, target_first_turn_audio_lens = collate_first_turn_audio(
-            cuts.resample(self.target_sample_rate), roles=self.output_roles, recording_field="target_audio"
-        )
+        
+        # Common metadata processing
         metadata = []
         for id, cut in enumerate(cuts):
             metadata.append({'audio_filepath': cut.id + '.wav'})
 
-        return {
+        # Base return dictionary with common fields
+        result = {
             "sample_id": [str(cut.id) for cut in cuts],
             "source_audio": source_audio,
             "source_audio_lens": source_audio_lens,
-            "target_audio": target_audio,
-            "target_audio_lens": target_audio_lens,
             "target_tokens": target_tokens,
             "target_token_lens": target_token_lens,
             "source_tokens": source_tokens,
@@ -141,13 +142,60 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
             "target_texts": [
                 " ".join(s.text for s in cut.supervisions if s.speaker in self.output_roles) for cut in cuts
             ],
-            "target_first_turn_audio": target_first_turn_audio,
-            "target_first_turn_audio_lens": target_first_turn_audio_lens,
             "formatter": [getattr(cut, "formatter", "s2s_duplex") for cut in cuts],
             "metadata": metadata,
         }
 
-    def __getitem__duplex_fc__(self, cuts: CutSet) -> dict:
+        # Speech to speech
+        if not is_s2t:
+            target_audio, target_audio_lens = collate_audio(
+                cuts.resample(self.target_sample_rate), recording_field="target_audio"
+            )
+            # extract target speaker first turn audio to uses for speaker conditioning
+            target_first_turn_audio, target_first_turn_audio_lens = collate_first_turn_audio(
+                cuts.resample(self.target_sample_rate), roles=self.output_roles, recording_field="target_audio"
+            )
+            result.update({
+                "target_audio": target_audio,
+                "target_audio_lens": target_audio_lens,
+                "target_first_turn_audio": target_first_turn_audio,
+                "target_first_turn_audio_lens": target_first_turn_audio_lens,
+            })
+
+        return result
+
+
+
+    def __getitem__t2t_(self, cuts: CutSet) -> dict:
+        text_cuts = cuts.filter(lambda c: isinstance(c, Formattable))
+        text_data = None
+        if text_cuts:
+            text_tokens = []
+            text_token_lens = []
+            for c in text_cuts:
+                if c.input_ids.shape[0] > self.text_max_tokens:
+                    # randomly select a segment of input_ids
+                    # start = torch.randint(0, c.input_ids.shape[0] - self.text_max_tokens + 1, (1,)).item()
+                    # end = start + self.text_max_tokens
+                    # text_ids = c.input_ids[start:end]
+                    raise RuntimeError(f"Text too long: {c.input_ids.shape[0]} > {self.text_max_tokens}")
+                else:
+                    text_ids = c.input_ids
+
+                text_tokens.append(text_ids)
+                text_token_lens.append(text_ids.shape[0])
+
+            text_tokens = collate_vectors(
+                text_tokens, padding_value=get_pad_id(self.tokenizer)
+            )
+            text_token_lens = torch.tensor(text_token_lens, dtype=torch.long)
+            text_data = {
+                "text_tokens": text_tokens,
+                "text_token_lens": text_token_lens,
+            }
+        return text_data
+
+    def __getitem__duplex_functioncalling_(self, cuts: CutSet) -> dict:
         cuts = cuts.transform_text(_strip_timestamps)
         source_audio, source_audio_lens = collate_audio(cuts.resample(self.source_sample_rate))
         target_audio, target_audio_lens = collate_audio(
