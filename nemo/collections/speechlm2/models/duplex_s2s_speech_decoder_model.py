@@ -156,12 +156,11 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 self.tokenizer.pad_token = '<|extra_1|>'
 
         llm = load_pretrained_hf(self.cfg.pretrained_llm, pretrained_weights=self.cfg.pretrained_weights).train()
-        self.llm = llm.model  # fetch PretrainedBaseModel from model "ForCausalLM"
+        self.llm = getattr(llm, self.cfg.get("llm", {}).get("base_model_name", "model"))
         self.lm_head = llm.lm_head
-        # Note: we have to "move out" the token embedding outside of LLM to avoid
-        #       messing up FSDP/TP hooks.
-        self.embed_tokens = self.llm.embed_tokens
-        del self.llm.embed_tokens
+        self.embed_tokens = getattr(self.llm, self.cfg.get("llm", {}).get("embeddings_name", "embed_tokens"))
+        del getattr(self.llm, self.cfg.get("llm", {}).get("embeddings_name", "embed_tokens"))
+        
         maybe_install_lora(self)
 
         # Load the pretrained streaming ASR model and copy its parameters into the audio perception module.
@@ -348,9 +347,16 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 (1) llm cache depends on input cache is None or Not
                 (2) speech_generation cache relys on reset_input_and_kv_cache function.
         """
-        out = self.llm(
-            inputs_embeds=input_embeds, past_key_values=cache, use_cache=cache is not None, return_dict=True
-        )
+
+        kwargs = {
+            "inputs_embeds": input_embeds,
+            "return_dict": True,
+        }
+        if cache is not None:
+            kwargs['use_cache'] = True
+            cache_key = self.cfg.get("llm", {}).get("cache_key", "past_key_values")
+            kwargs[cache_key] = cache
+        out = self.llm(**kwargs)
         B, T = input_embeds.shape[:2]
         text_logits = self.lm_head(out['last_hidden_state'])  # (B, T, text_vocab_size)
 
@@ -410,7 +416,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             "audio_logits": audio_logits,
         }
         if cache is not None:
-            ans["cache"] = out["past_key_values"]
+            ans["cache"] = out[cache_key]
 
         return ans
 
@@ -1257,7 +1263,12 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         input_embeds *= self.cfg.get("duplex_user_channel_weight", 1.0)
 
         # This cache is for self.llm
-        cache = DynamicCache()
+        llm_use_cache = self.cfg.get("llm", {}).get("use_cache", True)
+        if llm_use_cache:
+            cache_class = self.cfg.get("llm", {}).get("cache_class", "DynamicCache")
+            cache = cache_class()
+        else:
+            cache = None
         # Call reset_input_and_kv_cache to enable cache for TransformerARSpeechDecoder
         self.speech_generation.reset_input_and_kv_cache(use_cache=True)
         gen_text = torch.empty(B, T, device=self.device, dtype=torch.long)
@@ -1868,7 +1879,12 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         input_embeds *= self.cfg.get("duplex_user_channel_weight", 1.0)
 
         # This cache is for self.llm
-        cache = DynamicCache()
+        llm_use_cache = self.cfg.get("llm", {}).get("use_cache", True)
+        if llm_use_cache:
+            cache_class = self.cfg.get("llm", {}).get("cache_class", "DynamicCache")
+            cache = cache_class()
+        else:
+            cache = None
         # Call reset_input_and_kv_cache to enable cache for TransformerARSpeechDecoder
         self.speech_generation.reset_input_and_kv_cache(use_cache=True)
         gen_text = torch.empty(B, T, device=self.device, dtype=torch.long)
@@ -1882,7 +1898,12 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             device=self.device,
             dtype=torch.long,
         )
-        ans = self(input_embeds[:, :1], cache=cache, input_audio_tokens=first_audio, loss_mask=None)
+        ans = self(
+            input_embeds[:, :1], 
+            cache=cache, 
+            input_audio_tokens=first_audio, 
+            loss_mask=None
+        )
         gen_text[:, 0] = ans["text_logits"][:, -1].argmax(dim=-1)
         gen_audio[:, 0] = ans["audio_logits"][:, -1].argmax(dim=-1)
 
@@ -1891,7 +1912,11 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             last_emb = self.embed_tokens(gen_text[:, t - 1])
             input_embeds[:, t] += last_emb
             current_audio = gen_audio[:, t - 1 : t, :]
-            ans = self(input_embeds[:, t : t + 1], cache=ans["cache"], input_audio_tokens=current_audio)
+            ans = self(
+                input_embeds[:, t : t + 1], 
+                cache=ans["cache"], 
+                input_audio_tokens=current_audio
+            )
             gen_text[:, t] = ans["text_logits"][:, -1].argmax(dim=-1)
             gen_audio[:, t] = ans["audio_logits"][:, -1].argmax(dim=-1)
         
