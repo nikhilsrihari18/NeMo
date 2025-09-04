@@ -159,7 +159,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         self.llm = getattr(llm, self.cfg.get("llm", {}).get("base_model_name", "model"))
         self.lm_head = llm.lm_head
         self.embed_tokens = getattr(self.llm, self.cfg.get("llm", {}).get("embeddings_name", "embed_tokens"))
-        del getattr(self.llm, self.cfg.get("llm", {}).get("embeddings_name", "embed_tokens"))
+        delattr(self.llm, self.cfg.get("llm", {}).get("embeddings_name", "embed_tokens"))
         
         maybe_install_lora(self)
 
