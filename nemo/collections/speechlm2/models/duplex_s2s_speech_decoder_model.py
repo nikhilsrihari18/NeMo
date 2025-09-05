@@ -36,7 +36,6 @@ from torch.distributed.tensor.parallel import (
     parallelize_module,
 )
 from torch.nn.utils.rnn import pad_sequence
-from transformers import DynamicCache
 
 from nemo.collections.audio.parts.utils.resampling import resample
 from nemo.collections.common.tokenizers import AutoTokenizer
@@ -1266,7 +1265,19 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         llm_use_cache = self.cfg.get("llm", {}).get("use_cache", True)
         if llm_use_cache:
             cache_class = self.cfg.get("llm", {}).get("cache_class", "DynamicCache")
-            cache = cache_class()
+            if cache_class == "DynamicCache":
+                from transformers import DynamicCache
+                cache = DynamicCache()
+            """
+            #ToDo: Add support for HybridCache
+            elif cache_class == "HybridCache":
+                from transformers import HybridCache
+                cache = StaticCache()
+            """
+            else:
+                logging.warning(f"Cache class {cache_class} not supported. Using no cache.")
+                llm_use_cache = False
+                cache = None
         else:
             cache = None
         # Call reset_input_and_kv_cache to enable cache for TransformerARSpeechDecoder
