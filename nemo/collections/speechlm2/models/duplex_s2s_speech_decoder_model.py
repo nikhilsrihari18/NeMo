@@ -358,6 +358,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         out = self.llm(**kwargs)
         B, T = input_embeds.shape[:2]
         text_logits = self.lm_head(out['last_hidden_state'])  # (B, T, text_vocab_size)
+        #print(f"NIKHIL out['last_hidden_state'].shape: {out['last_hidden_state'].shape}")
 
         if seq_mask is not None:
             # This is training Mode
@@ -365,6 +366,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             # disable cache in training mode
             if self.speech_generation.use_input_cache:
                 self.speech_generation.reset_input_and_kv_cache(use_cache=False)
+            #print(f"NIKHIL seq_mask.shape: {seq_mask.shape if seq_mask is not None else None}")
 
         # if inference time, uses the target text tokens sampled from the llm backbone
         if self.speech_generation.use_input_cache and not self.training:
@@ -396,17 +398,28 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 target_text_tokens = torch.where(eos_mask & drop_eos_mask, self.text_pad_id, target_text_tokens)
 
         if input_audio_tokens is not None:
-            audio_logits, _ = self.speech_generation(
-                out['last_hidden_state'].transpose(0, 1),
-                seq_mask,
-                input_audio_tokens=input_audio_tokens,
-                target_text_tokens=target_text_tokens,
-                modality_adapter_emb=modality_adapter_emb,
-                asr_emb=asr_emb,
-                speaker_encoder_emb=speaker_encoder_emb,
+            if self.speech_generation.use_input_cache and not self.training:
+                audio_logits, _ = self.speech_generation(
+                    out['last_hidden_state'][:,-1:,:].transpose(0, 1),
+                    seq_mask,
+                    input_audio_tokens=input_audio_tokens,
+                    target_text_tokens=target_text_tokens,
+                    modality_adapter_emb=modality_adapter_emb[:,-1:,:],
+                    asr_emb=asr_emb[:,-1:,:],
+                    speaker_encoder_emb=speaker_encoder_emb,
                 )
-
-            audio_logits = audio_logits.view(B, T, self._num_codebooks, self.speech_vocab_size)
+                audio_logits = audio_logits.view(B, 1, self._num_codebooks, self.speech_vocab_size)
+            else:
+                audio_logits, _ = self.speech_generation(
+                    out['last_hidden_state'].transpose(0, 1),
+                    seq_mask,
+                    input_audio_tokens=input_audio_tokens,
+                    target_text_tokens=target_text_tokens,
+                    modality_adapter_emb=modality_adapter_emb,
+                    asr_emb=asr_emb,
+                    speaker_encoder_emb=speaker_encoder_emb,
+                )
+                audio_logits = audio_logits.view(B, T, self._num_codebooks, self.speech_vocab_size)
         else:
             audio_logits = None
 
@@ -1268,20 +1281,21 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             if cache_class == "DynamicCache":
                 from transformers import DynamicCache
                 cache = DynamicCache()
-            """
-            #ToDo: Add support for HybridCache
-            elif cache_class == "HybridCache":
-                from transformers import HybridCache
-                cache = StaticCache()
-            """
+                """
+                #ToDo: Add support for HybridCache
+                elif cache_class == "HybridCache":
+                    from transformers import HybridCache
+                    cache = StaticCache()
+                """
             else:
                 logging.warning(f"Cache class {cache_class} not supported. Using no cache.")
                 llm_use_cache = False
                 cache = None
         else:
             cache = None
+        
         # Call reset_input_and_kv_cache to enable cache for TransformerARSpeechDecoder
-        self.speech_generation.reset_input_and_kv_cache(use_cache=True)
+        self.speech_generation.reset_input_and_kv_cache(use_cache=True) #if llm_use_cache else False)
         gen_text = torch.empty(B, T, device=self.device, dtype=torch.long)
         gen_audio = torch.empty(B, T, self._num_codebooks, device=self.device, dtype=torch.long)
 
@@ -1313,14 +1327,26 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             input_embeds[:, t] += last_emb
 
             current_audio = gen_audio[:, t - 1 : t, :]
+            
+            # If llm_use_cache is disabled, pass entire sequences up to current timestep
+            if not llm_use_cache:
+                input_embeds_slice = input_embeds[:, : t + 1]
+                source_encoded_slice = source_encoded[:, : t + 1]
+                asr_emb_slice = asr_emb[:, : t + 1]
+                ans["cache"] = None
+            else:
+                input_embeds_slice = input_embeds[:, t : t + 1]
+                source_encoded_slice = source_encoded[:, t : t + 1]
+                asr_emb_slice = asr_emb[:, t : t + 1]
+            
             ans = self(
-                input_embeds[:, t : t + 1],
+                input_embeds_slice,
                 cache=ans["cache"],
                 input_audio_tokens=current_audio,
                 seq_mask=None,
                 target_text_tokens=None,  # text input will be sampled from llm backbone
-                modality_adapter_emb=source_encoded[:, t : t + 1],
-                asr_emb=asr_emb[:, t : t + 1],
+                modality_adapter_emb=source_encoded_slice,
+                asr_emb=asr_emb_slice,
                 speaker_encoder_emb=None,  # for inference uses the cached inference_speaker_embedding
             )
             gen_text[:, t] = ans["text_logits"][:, -1].argmax(dim=-1)
@@ -1856,7 +1882,6 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 * "audio_len" output lengths as number of waveform samples of shape (B,) (when `decode_audio=True`).
         """
         
-        
         input_embeds_system_prompt = self.embed_tokens(sys_prompts)
         # No need this step since encoded_user is all zeros
         #encoded_user = torch.full([len(sys_prompts), 2048], 0.0, device=input_signal.device)
@@ -1896,12 +1921,12 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             if cache_class == "DynamicCache":
                 from transformers import DynamicCache
                 cache = DynamicCache()
-            """
-            #ToDo: Add support for HybridCache
-            elif cache_class == "HybridCache":
-                from transformers import HybridCache
-                cache = StaticCache()
-            """
+                """
+                #ToDo: Add support for HybridCache
+                elif cache_class == "HybridCache":
+                    from transformers import HybridCache
+                    cache = StaticCache()
+                """
             else:
                 logging.warning(f"Cache class {cache_class} not supported. Using no cache.")
                 llm_use_cache = False
@@ -1921,8 +1946,15 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             device=self.device,
             dtype=torch.long,
         )
+        
+        # If llm_use_cache is disabled, pass entire sequences up to current timestep
+        if not llm_use_cache:
+            input_embeds_slice = input_embeds[:, : t + 1]
+        else:
+            input_embeds_slice = input_embeds[:, t : t + 1]
+
         ans = self(
-            input_embeds[:, :1], 
+            input_embeds_slice, 
             cache=cache, 
             input_audio_tokens=first_audio, 
             loss_mask=None

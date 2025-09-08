@@ -388,6 +388,9 @@ class TransformerARSpeechDecoder(NeuralModule):
             if self.detach_input:
                 hidden_states = hidden_states.detach()
 
+        #print("NIKHIL0 hidden_states.shape:", hidden_states.shape)
+        #print("NIKHIL0 speech_mask.shape:", speech_mask.shape if speech_mask is not None else "")
+
         # input cache needed due our transformer kv cache implementation expect the whole left context
         if self.use_input_cache:
             if self.cache["hidden_states"] is None:
@@ -415,18 +418,27 @@ class TransformerARSpeechDecoder(NeuralModule):
                     self.cache["target_text_tokens"] = torch.cat([self.cache["target_text_tokens"], target_text_tokens], dim=1)
                     target_text_tokens = self.cache["target_text_tokens"]
 
+        #print("NIKHIL0.1 hidden_states.shape:", hidden_states.shape)
+        #print("NIKHIL0.1 speech_mask.shape:", speech_mask.shape if speech_mask is not None else "")
+        
         # map hidden states to the shape of the
         if hidden_states is not None and self.input_proj is not None:
             speech_decoder_input = self.input_proj(hidden_states)
         else:
             speech_decoder_input = hidden_states
 
+        #print("NIKHIL0.2 speech_decoder_input.shape:", speech_decoder_input.shape)
+        #print("NIKHIL0.2 speech_mask.shape:", speech_mask.shape if speech_mask is not None else "")
+        
         # workaround for inference, because during inference speech_mask will be None
         if speech_mask is None:
             speech_mask = torch.ones(
                 (speech_decoder_input.size(0), speech_decoder_input.size(1)),
                 device=speech_decoder_input.device,
             )
+
+        #print("NIKHIL1 speech_decoder_input.shape:", speech_decoder_input.shape)
+        #print("NIKHIL1 speech_mask.shape:", speech_mask.shape)
 
         # if cond on text tokens, sum text tokens with the llm latent
         if self.cond_on_text_tokens and target_text_tokens is not None:
@@ -516,6 +528,9 @@ class TransformerARSpeechDecoder(NeuralModule):
 
             speech_decoder_input = speech_decoder_input + asr_emb
 
+        #print("NIKHIL2 speech_decoder_input.shape:", speech_decoder_input.shape)
+        #print("NIKHIL2 speech_mask.shape:", speech_mask.shape)
+
         if self.use_speaker_encoder:
             # for inference uses the inference cached speaker embedding
             # ToDo: replace the repeat operation by adding over all inference time steps to speedup
@@ -569,6 +584,9 @@ class TransformerARSpeechDecoder(NeuralModule):
                 speech_decoder_input = gate * speech_decoder_input + (1 - gate) * audio_tokens_embedded
             else:
                 speech_decoder_input = speech_decoder_input + audio_tokens_embedded
+
+        #print("NIKHIL3 speech_decoder_input.shape:", speech_decoder_input.shape)
+        #print("NIKHIL3 speech_mask.shape:", speech_mask.shape)
 
         decoder_out = self.t5_decoder(x=speech_decoder_input, x_mask=speech_mask)['output']
 
