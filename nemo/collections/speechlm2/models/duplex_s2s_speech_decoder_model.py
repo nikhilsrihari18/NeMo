@@ -358,15 +358,13 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         out = self.llm(**kwargs)
         B, T = input_embeds.shape[:2]
         text_logits = self.lm_head(out['last_hidden_state'])  # (B, T, text_vocab_size)
-        #print(f"NIKHIL out['last_hidden_state'].shape: {out['last_hidden_state'].shape}")
-
+        
         if seq_mask is not None:
             # This is training Mode
             seq_mask = seq_mask[:, :, -1].reshape(seq_mask.size(0), seq_mask.size(1))
             # disable cache in training mode
             if self.speech_generation.use_input_cache:
                 self.speech_generation.reset_input_and_kv_cache(use_cache=False)
-            #print(f"NIKHIL seq_mask.shape: {seq_mask.shape if seq_mask is not None else None}")
 
         # if inference time, uses the target text tokens sampled from the llm backbone
         if self.speech_generation.use_input_cache and not self.training:
