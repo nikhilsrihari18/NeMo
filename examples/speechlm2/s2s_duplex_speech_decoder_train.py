@@ -24,14 +24,16 @@ from nemo.utils.trainer_utils import resolve_trainer_cfg
 
 torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
 
-
-@hydra_runner(config_path="conf", config_name="s2s_duplex_speech_decoder")
+# @hydra_runner(config_path="conf", config_name="s2s_duplex_speech_decoder")
+@hydra_runner(config_path="/workspace/studies/s013_word-alignment/e001_model-dev", config_name="Llama-3.1-Nemotron-Nano-8B-v1_wd-align")
 def train(cfg):
     OmegaConf.resolve(cfg)
     torch.distributed.init_process_group(backend="nccl")
     torch.set_float32_matmul_precision("medium")
     torch.backends.cudnn.allow_tf32 = True
+    
     trainer = Trainer(**resolve_trainer_cfg(cfg.trainer))
+    
     log_dir = exp_manager(trainer, cfg.get("exp_manager", None))
     OmegaConf.save(cfg, log_dir / "exp_config.yaml")
 
@@ -44,12 +46,13 @@ def train(cfg):
         source_sample_rate=cfg.data.source_sample_rate,
         target_sample_rate=cfg.data.target_sample_rate,
         input_roles=cfg.data.input_roles,
-        output_roles=cfg.data.output_roles
+        output_roles=cfg.data.output_roles,
+        use_word_pad=cfg.model.tokenizer.use_word_pad,
+        use_alignment_items=cfg.data.use_alignment_items
     )
     datamodule = DataModule(cfg.data, tokenizer=model.tokenizer, dataset=dataset)
 
     trainer.fit(model, datamodule)
-
-
+   
 if __name__ == "__main__":
     train()
