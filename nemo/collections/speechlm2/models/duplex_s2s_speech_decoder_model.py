@@ -1341,10 +1341,6 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             input_embeds[:, t] += last_emb
 
             current_audio = gen_audio[:, t - 1 : t, :]
-            
-
-
-
 
             # If llm_use_cache is disabled, pass entire sequences up to current timestep
             if not llm_use_cache:
@@ -1376,10 +1372,6 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             )
             gen_text[:, t] = ans["text_logits"][:, -1].argmax(dim=-1)
             gen_audio[:, t] = ans["audio_logits"][:, -1].argmax(dim=-1)
-
-
-
-
 
             if self.cfg.get('inference_force_speech_state', None):
                 # state 0 - silence, state 1 - speech
