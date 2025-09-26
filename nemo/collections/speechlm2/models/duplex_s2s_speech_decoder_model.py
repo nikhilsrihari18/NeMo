@@ -339,7 +339,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         modality_adapter_emb=None,
         asr_emb=None,
         speaker_encoder_emb=None,
-        llm_kwargs=None,
+        llm_kwargs={},
     ) -> dict[str, Tensor]:
         """
         Separated text and speech prediction:
@@ -353,14 +353,13 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             "inputs_embeds": input_embeds,
             "return_dict": True,
         }
+        kwargs.update(llm_kwargs)
         if cache is not None:
             kwargs['use_cache'] = True
             cache_key = self.cfg.get("llm", {}).get("cache_key", "past_key_values")
             kwargs[cache_key] = cache
-            if llm_kwargs:
-                kwargs['attention_mask'] = llm_kwargs['attention_mask']
-                kwargs['cache_position'] = llm_kwargs['cache_position']
-
+        else:
+            kwargs['use_cache'] = False
         out = self.llm(**kwargs)
         B, T = input_embeds.shape[:2]
         text_logits = self.lm_head(out['last_hidden_state'])  # (B, T, text_vocab_size)
