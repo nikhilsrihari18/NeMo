@@ -1289,6 +1289,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 cache = HybridMambaAttentionDynamicCache(
                     self.llm.config, batch_size=B, dtype=self.llm.dtype, device=self.llm.device
                 )
+                print(f"Cache class {cache_class} used")
             else:
                 logging.warning(f"Cache class {cache_class} not supported. Using no cache.")
                 llm_use_cache = False
