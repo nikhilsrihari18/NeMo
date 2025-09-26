@@ -1283,12 +1283,13 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             if cache_class == "DynamicCache":
                 from transformers import DynamicCache
                 cache = DynamicCache()
+                print(f"Cache class {cache_class} initialized during inference")
             elif cache_class == "HybridMambaAttentionDynamicCache":
                 from transformers.models.nemotron_h.modeling_nemotron_h import HybridMambaAttentionDynamicCache
                 cache = HybridMambaAttentionDynamicCache(
                     self.llm.config, batch_size=B, dtype=self.llm.dtype, device=self.llm.device
                 )
-                print(f"Cache class {cache_class} used")
+                print(f"Cache class {cache_class} initialized during inference")
             else:
                 logging.warning(f"Cache class {cache_class} not supported. Using no cache.")
                 llm_use_cache = False
@@ -1316,10 +1317,13 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                     "attention_mask": torch.ones_like(source_encoded[..., 0]), # shape (B, T_local)
                     "cache_position": torch.arange(seq_len, device=llm.device), # shape (T_local,)
                 }
+                print(f"LLM kwargs initialized during inference")
             else:
                 llm_kwargs = {}
+                print(f"LLM kwargs initialized empty during inference")
         else:
             llm_kwargs = {}
+            print(f"LLM kwargs initialized empty during inference")
         ans = self(
             input_embeds[:, :1],
             cache=cache,
