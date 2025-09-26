@@ -35,6 +35,18 @@ from typing import Tuple
 
 MIN_FRAMES_FOR_TEXT = 3
 
+
+
+
+def first_nonzero_idx_torch(x: torch.Tensor, zero_value: int = 0, none_value: int = -1):
+    # x: LongTensor/FloatTensor of shape (B, T)
+    mask = x != zero_value                 # (B, T) boolean
+    idx = mask.float().argmax(dim=1)       # first True index (garbage if no True)
+    has = mask.any(dim=1)                  # (B,)
+    fill = torch.full_like(idx, none_value)
+    return torch.where(has, idx, fill)     # (B,) LongTensor
+
+
 class DuplexS2SDataset(torch.utils.data.Dataset):
     """
     A dataset for duplex speech-to-speech models that handles bidirectional conversations.
@@ -100,7 +112,8 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         output_roles: list[str] = None,
         text_max_tokens: int = 10000,
         use_word_pad: bool = False,
-        use_alignment_items: bool = False
+        use_alignment_items: bool = False,
+        system_prompt: str | None = None,
     ):
         self.tokenizer = tokenizer
         self.use_word_pad = use_word_pad
@@ -111,6 +124,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         self.output_roles = set(ifnone(output_roles, ["agent"]))
         self.text_max_tokens = text_max_tokens
         self.use_alignment_items = use_alignment_items
+        self.system_prompt = system_prompt
 
         assert tokenizer.bos is not None, "BOS support in the tokenizer is required for S2S models."
         assert tokenizer.eos is not None, "EOS support in the tokenizer is required for S2S models."
@@ -128,7 +142,14 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
     def __getitem__duplex__(self, cuts: CutSet) -> dict:
         cuts = cuts.transform_text(_strip_timestamps)
         is_s2t = getattr(cuts[0], "s2t", False)
-
+        pad_id = get_pad_id(self.tokenizer)
+        
+        system_tokens = (
+            [] if self.system_prompt is None 
+            else get_system_prompt_ids(self.tokenizer, self.system_prompt)
+        )
+        offset = len(system_tokens)
+        
         source_audio, source_audio_lens = collate_audio(cuts.resample(self.source_sample_rate))
         target_tokens, target_token_lens = collate_token_channel(
             cuts, self.tokenizer, self.frame_length, roles=self.output_roles,
@@ -141,6 +162,36 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
             use_word_pad=self.use_word_pad
         )
         
+        # Add system prompt at the beginning of earliest among source and target
+        # Note: in our data, esp. real audio, the "agent" may start speaking before the "user"
+        B = target_tokens.shape[0]
+        target_first_positions = first_nonzero_idx_torch(target_tokens, pad_id)
+        source_first_positions = first_nonzero_idx_torch(source_tokens, pad_id)
+        
+        # Make room for system prompt at the beginning of the sequence
+        if any(source_first_positions <= offset) or any(target_first_positions <= offset):  
+            target_tokens = torch.cat(
+                [torch.full((B, offset), fill_value=pad_id, dtype=target_tokens.dtype), target_tokens],
+                dim=1
+            )
+            
+            source_tokens = torch.cat(
+                [torch.full((B, offset), fill_value=pad_id, dtype=target_tokens.dtype), source_tokens],
+                dim=1
+            )
+        # Insert in the sequences    
+        for idx in range(B):
+            if (t_pos := target_first_positions[idx]) < (s_pos := source_first_positions[idx]):  # TODO: agent first not OK, add empty user turn !!!!
+                target_tokens[idx, :offset] = torch.tensor(
+                    system_tokens,
+                    dtype=target_tokens.dtype
+                )
+            else:
+                source_tokens[idx, :offset] = torch.tensor(
+                    system_tokens,
+                    dtype=source_tokens.dtype
+                )
+         
         # Common metadata processing
         metadata = []
         for id, cut in enumerate(cuts):
@@ -149,6 +200,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         # Base return dictionary with common fields
         result = {
             "sample_id": [str(cut.id) for cut in cuts],
+            "n_system_tokens": offset,
             "source_audio": source_audio,
             "source_audio_lens": source_audio_lens,
             "target_tokens": target_tokens,
@@ -162,7 +214,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
             "metadata": metadata,
         }
 
-        # Speech to speech  !!!!!!!!!!!!
+        # Speech to speech  
         if False:  #not is_s2t:  !!!!!!!!!!!
             # TODO(SE) This is failing in some cases because of this in collate_audio(...)
             # [rank2]:     first_supervision = [s for s in cut.supervisions if s.speaker in roles][0]
@@ -392,9 +444,19 @@ def collate_first_turn_audio(
 
 
 def get_word_pad_ids(tokenizer: TokenizerSpec):
-    return [tokenizer.tokenizer._tokenizer.token_to_id(tok)
-        for tok in ("<|wd_pad_id|>", "<|wd_epad_id|>")
-    ]
+    # TODO: move the token list to config
+    return tokenizer.tokenizer.convert_tokens_to_ids(
+        ["<|wd_pad_id|>", "<|wd_epad_id|>"]
+    ) 
+
+       
+def get_system_prompt_ids(tokenizer: TokenizerSpec, system_prompt: str):
+    # TODO: move the token list to config
+    return tokenizer.tokenizer.convert_tokens_to_ids(
+        ['<|begin_of_text|>', '<|start_header_id|>', 'system', '<|end_header_id|>'] +
+         tokenizer.tokenizer.tokenize(system_prompt) +
+         ['<|eot_id|>']
+    )
 
     
 def collate_token_channel(

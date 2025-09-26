@@ -25,7 +25,8 @@ from nemo.utils.trainer_utils import resolve_trainer_cfg
 torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
 
 # @hydra_runner(config_path="conf", config_name="s2s_duplex_speech_decoder")
-@hydra_runner(config_path="/workspace/studies/s013_word-alignment/e001_model-dev", config_name="Llama-3.1-Nemotron-Nano-8B-v1_wd-align")
+# @hydra_runner(config_path="/workspace/studies/s013_word-alignment/e001_model-dev", config_name="Llama-3.1-Nemotron-Nano-8B-v1_wd-align")
+@hydra_runner(config_path="/workspace/studies/s013_word-alignment/e001_model-dev", config_name="Llama-3.1-Nemotron-Nano-8B-v1_sys-prompt")
 def train(cfg):
     OmegaConf.resolve(cfg)
     torch.distributed.init_process_group(backend="nccl")
@@ -40,6 +41,10 @@ def train(cfg):
     with trainer.init_module():
         model = DuplexS2SSpeechDecoderModel(OmegaConf.to_container(cfg, resolve=True))
 
+    use_word_pad = cfg.model.tokenizer.get("use_word_pad", None)
+    use_alignment_items = cfg.data.get("use_alignment_items", None)
+    system_prompt = cfg.model.get("system_prompt", None)
+    
     dataset = DuplexS2SDataset(
         tokenizer=model.tokenizer,
         frame_length=cfg.data.frame_length,
@@ -47,8 +52,9 @@ def train(cfg):
         target_sample_rate=cfg.data.target_sample_rate,
         input_roles=cfg.data.input_roles,
         output_roles=cfg.data.output_roles,
-        use_word_pad=cfg.model.tokenizer.use_word_pad,
-        use_alignment_items=cfg.data.use_alignment_items
+        use_word_pad=use_word_pad,
+        use_alignment_items=use_alignment_items,
+        system_prompt=system_prompt
     )
     datamodule = DataModule(cfg.data, tokenizer=model.tokenizer, dataset=dataset)
 

@@ -210,7 +210,11 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
 
         # move back text channel by x, in inference it advance the text channel prediction by x frames
         self.advance_text_channel_by = self.cfg.get("advance_text_channel_by", None)
-
+        # handle system prompt    
+        self.system_prompt = self.cfg.get("system_prompt", None)
+        if self.system_prompt and self.advance_text_channel_by:
+            raise ValueError("\n You cannot not use advance_text_channel_by with system_prompt or you could delete part of it!!!\n")
+    
         # compute source fps
         self.source_fps = self.source_sample_rate / (
             self.source_sample_rate * cfg.data.frame_length
@@ -440,6 +444,15 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         """
         return get_pad_id(self.tokenizer)
 
+    @property
+    def system_prompt_ids(self) -> Tensor:
+        system_prompt = self.cfg.get("system_prompt", "")
+        return self.tokenizer.tokenizer.convert_tokens_to_ids(
+            ['<|begin_of_text|>', '<|start_header_id|>'] +
+            ['system', '<|end_header_id|>'] +
+            self.tokenizer.tokenizer.tokenize(system_prompt) +
+            ['<|eot_id|>']
+        )
     def forward(
         self,
         input_embeds: Tensor,
@@ -708,6 +721,21 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             input_signal_length=batch["source_audio_lens"],
             return_encoder_emb=True,
         )
+        
+        # zero-pad during system prompt
+        if (n_system_tokens := batch["n_system_tokens"]) > 0:
+            source_encoded = torch.cat(  # TODO(SE): padd the audio signal instead !!
+                [
+                    torch.zeros(
+                        source_encoded.shape[0],
+                        n_system_tokens,
+                        source_encoded.shape[-1],
+                        device=source_encoded.device,
+                        dtype=source_encoded.dtype
+                    ),
+                    source_encoded
+                ], dim=1,
+            )
 
         # if inference return speaker embedding None and it will use the cached speaker embedding
         if ignore_speech_gen or not self.training:
@@ -810,6 +838,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 source_encoded = source_encoded[:, :-remainder]
                 asr_emb = asr_emb[:, :-remainder]
 
+        # Prepare output labels
         text_inputs = input_ids[:, :-1, -1]  # (B, T-1)
         text_labels = input_ids[:, 1:, -1]  # (B, T-1)
         if not ignore_speech_gen and 'target_audio' in batch:
@@ -1334,9 +1363,17 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
 
     def _get_bos_embedding(self) -> torch.Tensor:
         """
-        Remove the audio codec embedding for the beginning of AR decoding.
+
         """
-        text_bos = torch.full((1,), fill_value=self.text_pad_id, device=self.device)
+        if self.system_prompt is not None:
+            text_bos = torch.tensor(
+                    self.system_prompt_ids,
+                    dtype=torch.long, 
+                    device=self.device
+            )
+        else: 
+            text_bos = torch.full((1,), fill_value=self.text_pad_id, device=self.device)
+        
         input_embeds = self.embed_tokens(text_bos)
         return input_embeds
 
@@ -1379,6 +1416,22 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             input_signal=input_signal, input_signal_length=input_signal_lens, return_encoder_emb=True
         )
         B, T_local, H = source_encoded.shape
+        
+        # Zero-pad during system prompt
+        if self.system_prompt is not None:
+            n_system_tokens = len(self.system_prompt_ids)
+            source_encoded = torch.cat(  # TODO(SE): padd the audio signal instead !!
+                [
+                    torch.zeros(
+                        source_encoded.shape[0],
+                        n_system_tokens,
+                        source_encoded.shape[-1],
+                        device=source_encoded.device,
+                        dtype=source_encoded.dtype
+                    ),
+                    source_encoded
+                ], dim=1,
+            )
 
         # Determine decoding length and pad if FSDP
         if self._use_fsdp:
@@ -1409,8 +1462,15 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             gen_audio = torch.empty(B, T, self._num_codebooks, device=self.device, dtype=torch.long)
         gen_text = torch.empty(B, T, device=self.device, dtype=torch.long)
 
-        # First step, use speech_delay token
-        input_embeds[:, 0] += self._get_bos_embedding()
+        # -- First step, use init tokens  -------        
+        if self.system_prompt is not None:
+            init_seq = self._get_bos_embedding()
+            input_embeds[:, :init_seq.shape[0]] = init_seq
+        else:
+            # input_embeds[:, 0] += self._get_bos_embedding()
+            input_embeds[:, 0] = self._get_bos_embedding()  # Note: overwriting instead of adding in orig solution
+            # TODO: append instead of overwriting
+            
         if not ignore_speech_gen:
             first_audio = torch.full(
                 [B, 1, self._num_codebooks],
