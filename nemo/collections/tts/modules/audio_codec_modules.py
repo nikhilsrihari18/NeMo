@@ -76,9 +76,7 @@ def get_up_sample_padding(kernel_size: int, stride: int) -> Tuple[int, int]:
 class SSLModel(NeuralModule):
     def __init__(self, slm_model_name):
         super().__init__()
-        print("<NIKHIL>Loading SSL model from: " + slm_model_name)
         self.ssl_model = AutoModel.from_pretrained(pretrained_model_name_or_path=slm_model_name)
-        print("<NIKHIL2>Loading SSL model failed: " + slm_model_name)
 
     def forward(self, *args, **kwargs):
         return self.ssl_model(*args, **kwargs)
