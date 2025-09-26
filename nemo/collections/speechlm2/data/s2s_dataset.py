@@ -181,7 +181,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
             )
         # Insert in the sequences    
         for idx in range(B):
-            if (t_pos := target_first_positions[idx]) < (s_pos := source_first_positions[idx]):  # TODO: agent first not OK, add empty user turn !!!!
+            if (t_pos := target_first_positions[idx]) < (s_pos := source_first_positions[idx]): 
                 target_tokens[idx, :offset] = torch.tensor(
                     system_tokens,
                     dtype=target_tokens.dtype
@@ -215,11 +215,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         }
 
         # Speech to speech  
-        if False:  #not is_s2t:  !!!!!!!!!!!
-            # TODO(SE) This is failing in some cases because of this in collate_audio(...)
-            # [rank2]:     first_supervision = [s for s in cut.supervisions if s.speaker in roles][0]
-            # [rank2]:                         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^
-            # [rank2]: IndexError: list index out of range
+        if not is_s2t:
             target_audio, target_audio_lens = collate_audio(
                 cuts.resample(self.target_sample_rate), recording_field="target_audio"
             )
