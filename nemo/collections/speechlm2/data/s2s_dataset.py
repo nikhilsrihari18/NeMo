@@ -392,10 +392,10 @@ def collate_first_turn_audio(
 
 
 def get_word_pad_ids(tokenizer: TokenizerSpec):
-    return tokenizer.convert_tokens_to_ids(
-        ["<|wd_pad_id|>", "<|wd_epad_id|>"]
-    ).tolist()
-    
+    return [tokenizer.tokenizer._tokenizer.token_to_id(tok)
+        for tok in ("<|wd_pad_id|>", "<|wd_epad_id|>")
+    ]
+
     
 def collate_token_channel(
     cuts: CutSet,

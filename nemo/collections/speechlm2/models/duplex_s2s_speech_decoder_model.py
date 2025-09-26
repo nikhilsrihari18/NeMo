@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# flake8: noqa: E501, E302
+# flake8: noqa: E501,
+# E302
 
 import json
 import os
@@ -64,6 +65,91 @@ from nemo.collections.speechlm2.parts.pretrained import (
 from nemo.core.neural_types import AudioSignal, LabelsType, LengthsType, NeuralType
 from nemo.utils import logging
 
+
+def resize_lm_head(lm_head, new_vocab_size, init_std=0.02):
+    """ !!! UNUSED !!!"""
+    old_weight = lm_head.weight.data
+    old_vocab, hidden = old_weight.shape  # nn.Linear has weight shape (out_features, in_features)
+    device, dtype = old_weight.device, old_weight.dtype
+
+    new_lm_head = nn.Linear(
+        hidden, new_vocab_size,
+        bias=(lm_head.bias is not None)
+    ).to(device=device, dtype=dtype)
+
+    # copy existing rows
+    n_copy = min(old_vocab, new_vocab_size)
+    new_lm_head.weight.data[:n_copy] = old_weight[:n_copy]
+    if lm_head.bias is not None:
+        new_lm_head.bias.data.zero_()
+        if n_copy > 0:
+            new_lm_head.bias.data[:n_copy] = lm_head.bias.data[:n_copy]
+
+    # init the extra rows
+    if new_vocab_size > old_vocab:
+        torch.nn.init.normal_(new_lm_head.weight.data[old_vocab:], mean=0.0, std=init_std)
+
+    return new_lm_head
+
+    
+def add_word_pad_token_embeddings(llm, tokenizer, train_new_embed_only):
+    """Add word padding tokens as special tokens and prepare to learn new embeddings for them
+    while freezing all the others
+    """
+    new_tokens = ["<|wd_pad_id|>", "<|wd_epad_id|>"]
+    orig_vocab_size = tokenizer.vocab_size  # BEFORE adding tokens
+    tokenizer.add_special_tokens(
+        {"additional_special_tokens": new_tokens}
+    )
+    new_vocab_size = orig_vocab_size + len(new_tokens)
+    # Important: resize model embeddings to match new tokenizer length
+    llm.resize_token_embeddings(new_vocab_size)
+    
+    # If model has untied output embeddings,
+    # Update lm head to include new tokens as part of the output
+    
+    # NOT NEEDED !!! llm.resize_token_embeddings() above also resizes
+    # lm_head even though test below says it's not tied !!!!!!!!!
+    
+    # if llm.lm_head is not llm.model.embed_tokens: 
+    #    llm.lm_head = resize_lm_head(llm.lm_head, new_vocab_size, init_std=0.02)
+           
+    if train_new_embed_only:    
+        llm.model.embed_tokens.weight.requires_grad = True
+
+        # IDs for the just-added tokens (robust even if vocab grew from other sources)
+        new_token_ids = tokenizer.convert_tokens_to_ids(new_tokens)
+        new_token_ids = torch.tensor(sorted(set(int(i) for i in new_token_ids)), dtype=torch.long)
+
+        # Build the complement set (rows to freeze)
+        freeze_ids = torch.tensor(
+            [i for i in range(llm.model.embed_tokens.num_embeddings) if i not in set(new_token_ids.tolist())],
+            dtype=torch.long
+        )            
+        # Register a hook that zeroes the gradient on all "freeze_ids"
+        def mask_old_rows(grad: torch.Tensor):
+            # grad shape == (vocab_size, hidden_size)
+            if grad is None:
+                return grad
+            if freeze_ids.numel() > 0:
+                grad.index_fill_(0, freeze_ids.to(grad.device), 0)
+            return grad
+
+        _ = llm.model.embed_tokens.weight.register_hook(mask_old_rows)
+        
+        # If model has untied output embeddings, also mask the LM head
+        if llm.lm_head is not llm.model.embed_tokens:  # untied
+            # If it's a Linear with shape (vocab, hidden), we mask rows by zeroing grad rows
+            if hasattr(llm.lm_head, "weight") and llm.lm_head.weight.shape[0] == llm.model.embed_tokens.num_embeddings:
+                llm.lm_head.weight.requires_grad = True
+                def mask_old_rows_lm_head(grad: torch.Tensor):
+                    if grad is None:
+                        return grad
+                    if freeze_ids.numel() > 0:
+                        grad.index_fill_(0, freeze_ids.to(grad.device), 0)
+                    return grad
+                _ = llm.lm_head.weight.register_hook(mask_old_rows_lm_head)
+                
 
 def delay_eos(tokens, eos_token_id, pad_token_id, shift=10):
     """
@@ -159,17 +245,25 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             if self.cfg.get("use_extra_id_for_pad", False):
                 self.tokenizer.pad_token = '<|extra_1|>'
 
-        llm = load_pretrained_hf(self.cfg.pretrained_llm, pretrained_weights=self.cfg.pretrained_weights).train()
+        llm = load_pretrained_hf(
+            self.cfg.pretrained_llm, pretrained_weights=self.cfg.pretrained_weights
+        ).train()
+        
+        # Add word padding tokens and prepare to learn new embeddings just for them
+        if self.cfg.get("tokenizer", None) and self.cfg.tokenizer.get("use_word_pad", None):
+            add_word_pad_token_embeddings(
+                llm, 
+                self.tokenizer,
+                cfg.get("tokenizer.train_new_embed_only", None)
+            )
+        
         self.llm = llm.model  # fetch PretrainedBaseModel from model "ForCausalLM"
         self.lm_head = llm.lm_head
+        
         # Note: we have to "move out" the token embedding outside of LLM to avoid
         #       messing up FSDP/TP hooks.
         self.embed_tokens = self.llm.embed_tokens
         del self.llm.embed_tokens
-        
-        # Add word padding tokens and prepare to learn new embeddings just for them
-        if self.cfg.get("tokenizer.use_word_pad", None):
-            add_word_pad_token_embeddings(self, cfg.get("tokenizer.train_new_embed_only", None))
         
         maybe_install_lora(self)
 
@@ -230,55 +324,6 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         # Storage for collecting validation results across GPUs
         self.validation_results = defaultdict(list)
 
-        
-    def add_word_pad_token_embeddings(self, train_new_embed_only):
-        """Add word padding tokens as special tokens and prepare to learn new embeddings for them
-        while freezing all the others
-        """
-        new_tokens = ["<|wd_pad_id|>", "<|wd_epad_id|>"]
-        orig_vocab_size = self.tokenizer.vocab_size  # BEFORE adding tokens
-        self.tokenizer.add_special_tokens(
-            {"additional_special_tokens": new_tokens}
-        )
-        # Important: resize model embeddings to match new tokenizer length
-        self.llm.resize_token_embeddings(len(self.tokenizer))
-        
-        if train_new_embed_only:    
-            self.embed_tokens.weight.requires_grad = True
-
-            # IDs for the just-added tokens (robust even if vocab grew from other sources)
-            new_token_ids = self.tokenizer.convert_tokens_to_ids(new_tokens)
-            new_token_ids = torch.tensor(sorted(set(int(i) for i in new_token_ids)), dtype=torch.long)
-
-            # Build the complement set (rows to freeze)
-            freeze_ids = torch.tensor(
-                [i for i in range(self.embed_tokens.num_embeddings) if i not in set(new_token_ids.tolist())],
-                dtype=torch.long
-            )            
-            # Register a hook that zeroes the gradient on all "freeze_ids"
-            def mask_old_rows(grad: torch.Tensor):
-                # grad shape == (vocab_size, hidden_size)
-                if grad is None:
-                    return grad
-                if freeze_ids.numel() > 0:
-                    grad.index_fill_(0, freeze_ids.to(grad.device), 0)
-                return grad
-
-            _ = self.embed_tokens.weight.register_hook(mask_old_rows)
-            
-            # If model has untied output embeddings, also mask the LM head
-            if self.lm_head is not None and self.lm_head is not self.embed_tokens:  # untied
-                # If it's a Linear with shape (vocab, hidden), we mask rows by zeroing grad rows
-                if hasattr(self.lm_head, "weight") and self.lm_head.weight.shape[0] == self.embed_tokens.num_embeddings:
-                    self.lm_head.weight.requires_grad = True
-                    def mask_old_rows_lm_head(grad: torch.Tensor):
-                        if grad is None:
-                            return grad
-                        if freeze_ids.numel() > 0:
-                            grad.index_fill_(0, freeze_ids.to(grad.device), 0)
-                        return grad
-                    _ = self.lm_head.weight.register_hook(mask_old_rows_lm_head)
-    
 
     def init_speech_generation_from_tts_checkpoint(self, checkpoint_path):
         if checkpoint_path is not None:
@@ -978,7 +1023,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             text_loss = torch.nn.functional.cross_entropy(
                 text_logits.flatten(0, 1),  # (B, T, Vt) -> (*, Vt)
                 text_target.flatten(0, 1),
-                ignore_index=self.text_pad_id,
+                ignore_index=self.text_pad_id,  # SE: ignore wd pad as well? !!!!!
             )
             #text_loss = text_loss * self.cfg.get("t2t_loss_scale", 10.0)
             loss = self.cfg.get('text_to_text_loss_weight', 1) * text_loss
