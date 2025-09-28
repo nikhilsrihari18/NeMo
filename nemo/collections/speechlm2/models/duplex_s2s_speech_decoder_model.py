@@ -213,7 +213,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         # handle system prompt    
         self.system_prompt = self.cfg.get("system_prompt", None)
         if self.system_prompt and self.advance_text_channel_by:
-            raise ValueError("\n You cannot not use advance_text_channel_by with system_prompt or you could delete part of it!!!\n")
+            raise ValueError("\nYou cannot use advance_text_channel_by with system_prompt or you could delete part of it!!!\n")
     
         # compute source fps
         self.source_fps = self.source_sample_rate / (
@@ -656,6 +656,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         Similar to DuplexS2SModel.prepare_inputs, with following changes:
             (1) Add 'input_audio_tokens' and 'seq_mask' in return value for TransformerARSpeechDecoder
             (2) Remove audio codec embedding from 'input_embeds'
+            ...
         """
         ignore_speech_gen = self.cfg.get("ignore_speech_gen", None)
         
@@ -722,20 +723,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             return_encoder_emb=True,
         )
         
-        # zero-pad during system prompt
-        if (n_system_tokens := batch["n_system_tokens"]) > 0:
-            source_encoded = torch.cat(  # TODO(SE): padd the audio signal instead !!
-                [
-                    torch.zeros(
-                        source_encoded.shape[0],
-                        n_system_tokens,
-                        source_encoded.shape[-1],
-                        device=source_encoded.device,
-                        dtype=source_encoded.dtype
-                    ),
-                    source_encoded
-                ], dim=1,
-            )
+        # zero-pad during system prompt : now done in loader
 
         # if inference return speaker embedding None and it will use the cached speaker embedding
         if ignore_speech_gen or not self.training:
@@ -1052,7 +1040,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             text_loss = torch.nn.functional.cross_entropy(
                 text_logits.flatten(0, 1),  # (B, T, Vt) -> (*, Vt)
                 text_target.flatten(0, 1),
-                ignore_index=self.text_pad_id,  # SE: ignore wd pad as well? !!!!!
+                ignore_index=self.text_pad_id,
             )
             #text_loss = text_loss * self.cfg.get("t2t_loss_scale", 10.0)
             loss = self.cfg.get('text_to_text_loss_weight', 1) * text_loss
@@ -1417,21 +1405,21 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         )
         B, T_local, H = source_encoded.shape
         
-        # Zero-pad during system prompt
-        if self.system_prompt is not None:
-            n_system_tokens = len(self.system_prompt_ids)
-            source_encoded = torch.cat(  # TODO(SE): padd the audio signal instead !!
-                [
-                    torch.zeros(
-                        source_encoded.shape[0],
-                        n_system_tokens,
-                        source_encoded.shape[-1],
-                        device=source_encoded.device,
-                        dtype=source_encoded.dtype
-                    ),
-                    source_encoded
-                ], dim=1,
-            )
+        # Zero-pad during system prompt: now done in data loader
+        # if self.system_prompt is not None:
+        #     n_system_tokens = len(self.system_prompt_ids)
+        #     source_encoded = torch.cat(  # TODO(SE): padd the audio signal instead !!
+        #         [
+        #             torch.zeros(
+        #                 source_encoded.shape[0],
+        #                 n_system_tokens,
+        #                 source_encoded.shape[-1],
+        #                 device=source_encoded.device,
+        #                 dtype=source_encoded.dtype
+        #             ),
+        #             source_encoded
+        #         ], dim=1,
+        #     )
 
         # Determine decoding length and pad if FSDP
         if self._use_fsdp:

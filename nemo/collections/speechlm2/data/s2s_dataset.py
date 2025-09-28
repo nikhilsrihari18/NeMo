@@ -20,7 +20,7 @@ import torch
 import torch.utils.data
 import torchaudio
 
-from lhotse import CutSet, MonoCut, Recording, Seconds, SupervisionSegment, compute_num_frames
+from lhotse import CutSet, MonoCut, Recording, Seconds, SupervisionSegment, compute_num_frames, compute_num_samples
 from lhotse.supervision import AlignmentItem
 from lhotse.cut import Cut
 from lhotse.dataset.collation import collate_audio, collate_vectors
@@ -151,6 +151,24 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         offset = len(system_tokens)
         
         source_audio, source_audio_lens = collate_audio(cuts.resample(self.source_sample_rate))
+        if offset > 0:
+            n_extra_samples = compute_num_samples(
+                offset * self.frame_length,
+                self.source_sample_rate
+            )
+            source_audio = torch.cat(
+                [
+                    torch.zeros(
+                        source_audio.shape[0],
+                        n_extra_samples,
+                        device=source_audio.device,
+                        dtype=source_audio.dtype
+                    ),
+                    source_audio
+                ], dim=-1,
+            )
+            source_audio_lens += n_extra_samples
+        
         target_tokens, target_token_lens = collate_token_channel(
             cuts, self.tokenizer, self.frame_length, roles=self.output_roles,
             use_alignment_items=self.use_alignment_items,
@@ -162,14 +180,14 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
             use_word_pad=self.use_word_pad
         )
         
-        # Add system prompt at the beginning of earliest among source and target
-        # Note: in our data, esp. real audio, the "agent" may start speaking before the "user"
-        B = target_tokens.shape[0]
-        target_first_positions = first_nonzero_idx_torch(target_tokens, pad_id)
-        source_first_positions = first_nonzero_idx_torch(source_tokens, pad_id)
-        
-        # Make room for system prompt at the beginning of the sequence
-        if any(source_first_positions <= offset) or any(target_first_positions <= offset):  
+        if offset > 0:
+            # Add system prompt at the beginning of earliest among source and target
+            # Note: in our data, esp. real audio, the "agent" may start speaking before the "user"
+            B = target_tokens.shape[0]
+            target_first_positions = first_nonzero_idx_torch(target_tokens, pad_id)
+            source_first_positions = first_nonzero_idx_torch(source_tokens, pad_id)
+            
+            # Make room for system prompt at the beginning of the sequence
             target_tokens = torch.cat(
                 [torch.full((B, offset), fill_value=pad_id, dtype=target_tokens.dtype), target_tokens],
                 dim=1
@@ -181,7 +199,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
             )
         # Insert in the sequences    
         for idx in range(B):
-            if (t_pos := target_first_positions[idx]) < (s_pos := source_first_positions[idx]): 
+            if target_first_positions[idx] < source_first_positions[idx]: 
                 target_tokens[idx, :offset] = torch.tensor(
                     system_tokens,
                     dtype=target_tokens.dtype
@@ -200,7 +218,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         # Base return dictionary with common fields
         result = {
             "sample_id": [str(cut.id) for cut in cuts],
-            "n_system_tokens": offset,
+            #"n_system_tokens": offset,
             "source_audio": source_audio,
             "source_audio_lens": source_audio_lens,
             "target_tokens": target_tokens,
