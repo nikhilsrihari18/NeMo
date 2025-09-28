@@ -1258,6 +1258,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         B, T_local, H = source_encoded.shape
 
         # Determine decoding length and pad if FSDP
+        print("self._use_fsdp", self._use_fsdp)
         if self._use_fsdp:
             T_tensor = torch.tensor([T_local], device=source_encoded.device)
             dist.all_reduce(T_tensor, op=dist.ReduceOp.MAX)
@@ -1314,8 +1315,8 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         if llm_use_cache:
             if self.cfg.get("llm", {}).get("architecture", "transformers") == "nemotron_h":
                 llm_kwargs = {
-                    "attention_mask": torch.ones_like(source_encoded[..., 0]), # shape (B, T_local)
-                    "cache_position": torch.arange(seq_len, device=llm.device), # shape (T_local,)
+                    "attention_mask": torch.ones_like(source_encoded[:, :1, 0]), # shape (B, 1)
+                    "cache_position": torch.arange(1, device=source_encoded.device, dtype=source_encoded.dtype), # shape (1)
                 }
                 print(f"LLM kwargs initialized during inference")
             else:
@@ -1347,22 +1348,22 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             current_audio = gen_audio[:, t - 1 : t, :]
 
             # If llm_use_cache is disabled, pass entire sequences up to current timestep
-            if not llm_use_cache:
-                input_embeds_slice = input_embeds[:, : t + 1]
-                source_encoded_slice = source_encoded[:, : t + 1]
-                asr_emb_slice = asr_emb[:, : t + 1]
-                ans["cache"] = None
-            else:
+            if llm_use_cache:
                 input_embeds_slice = input_embeds[:, t : t + 1]
                 source_encoded_slice = source_encoded[:, t : t + 1]
                 asr_emb_slice = asr_emb[:, t : t + 1]
                 if self.cfg.get("llm", {}).get("architecture", "transformers") == "nemotron_h":
                     # Grow attention mask by one valid token
-                    new_mask = torch.ones((B, 1), dtype=self.llm.dtype, device=self.llm.device)
+                    new_mask = torch.ones((B, 1), dtype=llm_kwargs['attention_mask'].dtype, device=llm_kwargs['attention_mask'].device)
                     llm_kwargs['attention_mask'] = torch.cat([llm_kwargs['attention_mask'], new_mask], dim=1)
                     # Set absolute position of the new token
-                    llm_kwargs['cache_position'] = torch.tensor([llm_kwargs['cache_position'].shape[1] - 1], device=self.llm.device)  # shape: (1,)
-            
+                    llm_kwargs['cache_position'] = torch.tensor([llm_kwargs['attention_mask'].shape[1]-1], dtype=llm_kwargs['attention_mask'].dtype, device=llm_kwargs['attention_mask'].device)  # shape: (1,)
+            else:
+                input_embeds_slice = input_embeds[:, : t + 1]
+                source_encoded_slice = source_encoded[:, : t + 1]
+                asr_emb_slice = asr_emb[:, : t + 1]
+                ans["cache"] = None
+
             ans = self(
                 input_embeds_slice,
                 cache=ans["cache"],
