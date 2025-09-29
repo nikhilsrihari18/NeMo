@@ -266,6 +266,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         else:
             logging.info("Silence tokens disabled. Using speech_nosil_id for silence positions.")
         #self.silence_tokens = self.generate_silence_tokens(16000, self._num_codebooks)
+    
     @property
     def speech_vocab_size(self):
         """Return the size of the audio codec codebook including extra speech BOS and EOS tokens."""
@@ -338,6 +339,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         modality_adapter_emb=None,
         asr_emb=None,
         speaker_encoder_emb=None,
+        llm_kwargs={},
     ) -> dict[str, Tensor]:
         """
         Separated text and speech prediction:
@@ -351,10 +353,13 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             "inputs_embeds": input_embeds,
             "return_dict": True,
         }
+        kwargs.update(llm_kwargs)
         if cache is not None:
             kwargs['use_cache'] = True
             cache_key = self.cfg.get("llm", {}).get("cache_key", "past_key_values")
             kwargs[cache_key] = cache
+        else:
+            kwargs['use_cache'] = False
         out = self.llm(**kwargs)
         B, T = input_embeds.shape[:2]
         text_logits = self.lm_head(out['last_hidden_state'])  # (B, T, text_vocab_size)
@@ -1253,6 +1258,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         B, T_local, H = source_encoded.shape
 
         # Determine decoding length and pad if FSDP
+        print("self._use_fsdp", self._use_fsdp)
         if self._use_fsdp:
             T_tensor = torch.tensor([T_local], device=source_encoded.device)
             dist.all_reduce(T_tensor, op=dist.ReduceOp.MAX)
@@ -1271,7 +1277,6 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         # Apply channel weight
         input_embeds = source_encoded.clone()
         input_embeds *= self.cfg.get("duplex_user_channel_weight", 1.0)
-
         # This cache is for self.llm
         llm_use_cache = self.cfg.get("llm", {}).get("use_cache", True)
         if llm_use_cache:
@@ -1279,18 +1284,21 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             if cache_class == "DynamicCache":
                 from transformers import DynamicCache
                 cache = DynamicCache()
-                """
-                #ToDo: Add support for HybridCache
-                elif cache_class == "HybridCache":
-                    from transformers import HybridCache
-                    cache = StaticCache()
-                """
+                print(f"Cache class {cache_class} initialized during inference")
+            elif cache_class == "HybridMambaAttentionDynamicCache":
+                from transformers.models.nemotron_h.modeling_nemotron_h import HybridMambaAttentionDynamicCache
+                cache = HybridMambaAttentionDynamicCache(
+                    self.llm.config, batch_size=B, dtype=self.llm.dtype, device=self.llm.device
+                )
+                print(f"Cache class {cache_class} initialized during inference")
             else:
                 logging.warning(f"Cache class {cache_class} not supported. Using no cache.")
                 llm_use_cache = False
                 cache = None
+                print(f"Invalid cache class was specified, so no cache class was initialized")
         else:
             cache = None
+            print(f"Cache disabled, so no cache class was initialized")
         
         # Call reset_input_and_kv_cache to enable cache for TransformerARSpeechDecoder
         self.speech_generation.reset_input_and_kv_cache(use_cache=True) #if llm_use_cache else False)
@@ -1305,6 +1313,20 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             device=self.device,
             dtype=torch.long,
         )
+
+        if llm_use_cache:
+            if self.cfg.get("llm", {}).get("architecture", "transformers") == "nemotron_h":
+                llm_kwargs = {
+                    "attention_mask": torch.ones_like(source_encoded[:, :1, 0]), # shape (B, 1)
+                    "cache_position": torch.arange(1, device=source_encoded.device, dtype=source_encoded.dtype), # shape (1)
+                }
+                print(f"LLM kwargs initialized during inference")
+            else:
+                llm_kwargs = {}
+                print(f"LLM kwargs initialized empty during inference")
+        else:
+            llm_kwargs = {}
+            print(f"LLM kwargs initialized empty during inference")
         ans = self(
             input_embeds[:, :1],
             cache=cache,
@@ -1314,6 +1336,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             modality_adapter_emb=source_encoded[:, :1],
             asr_emb=asr_emb[:, :1],
             speaker_encoder_emb=None,  # for inference uses the cached inference_speaker_embedding
+            llm_kwargs=llm_kwargs,
         )
         gen_text[:, 0] = ans["text_logits"][:, -1].argmax(dim=-1)
         gen_audio[:, 0] = ans["audio_logits"][:, -1].argmax(dim=-1)
@@ -1325,18 +1348,24 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             input_embeds[:, t] += last_emb
 
             current_audio = gen_audio[:, t - 1 : t, :]
-            
+
             # If llm_use_cache is disabled, pass entire sequences up to current timestep
-            if not llm_use_cache:
+            if llm_use_cache:
+                input_embeds_slice = input_embeds[:, t : t + 1]
+                source_encoded_slice = source_encoded[:, t : t + 1]
+                asr_emb_slice = asr_emb[:, t : t + 1]
+                if self.cfg.get("llm", {}).get("architecture", "transformers") == "nemotron_h":
+                    # Grow attention mask by one valid token
+                    new_mask = torch.ones((B, 1), dtype=llm_kwargs['attention_mask'].dtype, device=llm_kwargs['attention_mask'].device)
+                    llm_kwargs['attention_mask'] = torch.cat([llm_kwargs['attention_mask'], new_mask], dim=1)
+                    # Set absolute position of the new token
+                    llm_kwargs['cache_position'] = torch.tensor([llm_kwargs['attention_mask'].shape[1]-1], dtype=llm_kwargs['attention_mask'].dtype, device=llm_kwargs['attention_mask'].device)  # shape: (1,)
+            else:
                 input_embeds_slice = input_embeds[:, : t + 1]
                 source_encoded_slice = source_encoded[:, : t + 1]
                 asr_emb_slice = asr_emb[:, : t + 1]
                 ans["cache"] = None
-            else:
-                input_embeds_slice = input_embeds[:, t : t + 1]
-                source_encoded_slice = source_encoded[:, t : t + 1]
-                asr_emb_slice = asr_emb[:, t : t + 1]
-            
+
             ans = self(
                 input_embeds_slice,
                 cache=ans["cache"],
@@ -1346,6 +1375,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 modality_adapter_emb=source_encoded_slice,
                 asr_emb=asr_emb_slice,
                 speaker_encoder_emb=None,  # for inference uses the cached inference_speaker_embedding
+                llm_kwargs=llm_kwargs,
             )
             gen_text[:, t] = ans["text_logits"][:, -1].argmax(dim=-1)
             gen_audio[:, t] = ans["audio_logits"][:, -1].argmax(dim=-1)
