@@ -1295,8 +1295,10 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 logging.warning(f"Cache class {cache_class} not supported. Using no cache.")
                 llm_use_cache = False
                 cache = None
+                print(f"Invalid cache class was specified, so no cache class was initialized")
         else:
             cache = None
+            print(f"Cache disabled, so no cache class was initialized")
         
         # Call reset_input_and_kv_cache to enable cache for TransformerARSpeechDecoder
         self.speech_generation.reset_input_and_kv_cache(use_cache=True) #if llm_use_cache else False)
