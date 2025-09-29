@@ -197,18 +197,18 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
                 [torch.full((B, offset), fill_value=pad_id, dtype=target_tokens.dtype), source_tokens],
                 dim=1
             )
-        # Insert in the sequences    
-        for idx in range(B):
-            if target_first_positions[idx] < source_first_positions[idx]: 
-                target_tokens[idx, :offset] = torch.tensor(
-                    system_tokens,
-                    dtype=target_tokens.dtype
-                )
-            else:
-                source_tokens[idx, :offset] = torch.tensor(
-                    system_tokens,
-                    dtype=source_tokens.dtype
-                )
+            # Insert in the sequences    
+            for idx in range(B):
+                if target_first_positions[idx] < source_first_positions[idx]: 
+                    target_tokens[idx, :offset] = torch.tensor(
+                        system_tokens,
+                        dtype=target_tokens.dtype
+                    )
+                else:
+                    source_tokens[idx, :offset] = torch.tensor(
+                        system_tokens,
+                        dtype=source_tokens.dtype
+                    )
          
         # Common metadata processing
         metadata = []
