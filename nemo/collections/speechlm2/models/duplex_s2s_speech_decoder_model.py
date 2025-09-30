@@ -210,6 +210,10 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
 
         # move back text channel by x, in inference it advance the text channel prediction by x frames
         self.advance_text_channel_by = self.cfg.get("advance_text_channel_by", None)
+        
+        # apply chat template
+        self.use_chat_template = self.cfg.get("use_chat_template", None)
+        
         # handle system prompt    
         self.system_prompt = self.cfg.get("system_prompt", None)
         if self.system_prompt and self.advance_text_channel_by:
@@ -443,7 +447,36 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
 
         """
         return get_pad_id(self.tokenizer)
+    
+    # -- The following are defined for NM nano v1, TODO: generalize to other models
+    @property
+    def start_header_id(self) -> int:
+        return self.tokenizer.tokenizer.convert_tokens_to_ids("<|start_header_id|>")
 
+    @property
+    def end_header_id(self) -> int:
+        return self.tokenizer.tokenizer.convert_tokens_to_ids("<|end_header_id|>")
+
+    @property
+    def user_role_id(self) -> int:
+        return self.tokenizer.tokenizer.convert_tokens_to_ids("user")
+    
+    @property
+    def assistant_role_id(self) -> int:
+        return self.tokenizer.tokenizer.convert_tokens_to_ids("assistant")
+    
+    @property
+    def user_start_ids(self) -> Tensor:
+        return self.tokenizer.tokenizer.convert_tokens_to_ids(
+            ['<|start_header_id|>', 'user', '<|end_header_id|>']
+        )
+    
+    @property
+    def assistant_start_ids(self) -> Tensor:
+        return self.tokenizer.tokenizer.convert_tokens_to_ids(
+            ['<|start_header_id|>', 'assistant', '<|end_header_id|>']
+        )
+        
     @property
     def system_prompt_ids(self) -> Tensor:
         system_prompt = self.cfg.get("system_prompt", "")
@@ -453,6 +486,8 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             self.tokenizer.tokenizer.tokenize(system_prompt) +
             ['<|eot_id|>']
         )
+    
+    
     def forward(
         self,
         input_embeds: Tensor,
@@ -525,7 +560,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 modality_adapter_emb=modality_adapter_emb,
                 asr_emb=asr_emb,
                 speaker_encoder_emb=speaker_encoder_emb,
-                )
+            ) # type: ignore
 
             audio_logits = audio_logits.view(B, T, self._num_codebooks, self.speech_vocab_size)
         else:
@@ -785,6 +820,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             target_codes = torch.where(btt == self.text_eos_id, self.speech_eos_id, target_codes)
 
             # ToDo: implement in a way that we can set the number of speech delay > 1   # SE !!!!
+            # TODO: CRITICAL to add speech delay with chat template because of additional role (header) tokens
             target_codes = torch.cat(
                 [
                     torch.full(
@@ -811,8 +847,11 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             # advance_text_channel_by tokens and this will breaks everything)
 
         if self.cfg.get("delay_text_eos_by", None):   # SE: not used in current config
-            target_tokens = delay_eos(target_tokens, self.text_eos_id, self.text_pad_id, shift=self.cfg.delay_text_eos_by)
-        
+            raise ValueError("\n!!! delay_eos is not yet compatible with activity masks !!!\n")
+            target_tokens = delay_eos(
+                target_tokens, self.text_eos_id, self.text_pad_id, shift=self.cfg.delay_text_eos_by
+            )
+                    
         if not ignore_speech_gen and 'target_audio' in batch:
             input_ids = torch.cat([target_codes, target_tokens[..., None]], dim=-1)
         else:
@@ -829,13 +868,58 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         # Prepare output labels
         text_inputs = input_ids[:, :-1, -1]  # (B, T-1)
         text_labels = input_ids[:, 1:, -1]  # (B, T-1)
+
         if not ignore_speech_gen and 'target_audio' in batch:
             audio_inputs = input_ids[:, :-1, :-1]  # (B, T-1, K)
             audio_labels = input_ids[:, 1:, :-1]  # (B, T-1, K)
-
+        
+        # Prepare inputs
         input_embeds = self.embed_tokens(text_inputs)
+        
+        source_tokens = batch["source_tokens"][:, :-1]
+        
+        if (diff := source_tokens.shape[1] - text_inputs.shape[1]) < 0:
+            source_tokens = torch.cat(
+                [
+                    source_tokens,
+                    #(
+                    torch.ones(
+                        source_tokens.shape[0], abs(diff),
+                        device=source_tokens.device,
+                        dtype=torch.long
+                    ) * self.text_pad_id
+                    #).to(torch.long),
+                ], dim=-1,
+            )
 
-        input_embeds.add_(source_encoded[:, :-1] * self.cfg.get("duplex_user_channel_weight", 1.0))
+
+        elif diff > 0:
+            source_tokens = source_tokens[:, :text_inputs.shape[1]]
+        
+
+        # Sum agent and user embeddings
+        if True:   # DEBUGGING !!!!!!!!!!!!!!!!!!!!!!!  TODO: add config var to select this
+            agent_padding_pos = text_inputs.eq(self.text_pad_id)   
+            user_padding_pos = source_tokens.eq(self.text_pad_id) 
+            
+            # Set agent padding token embeddings to 0
+            padding_pos = agent_padding_pos & ~user_padding_pos
+            input_embeds = input_embeds.masked_fill(padding_pos.unsqueeze(-1), 0.0)
+                        
+            # source_embeds = torch.clone(source_encoded[:, :-1])
+            
+            # Set user padding token embeddings to 0, can only be done for "forced" training with source text GT
+            padding_pos = ~agent_padding_pos & user_padding_pos
+            if False:  # Force user's text
+                source_embeds = self.embed_tokens(source_tokens)                
+            else:  # Use user's audio input
+                source_embeds = source_encoded[:, :-1] 
+            source_embeds = source_embeds.masked_fill(padding_pos.unsqueeze(-1), 0.0)
+            
+            # Safely add source and agent without 'interfering' padding token embeddings (when no speech overlap)
+            input_embeds.add_(source_embeds)
+        else:
+            input_embeds.add_(source_encoded[:, :-1] * self.cfg.get("duplex_user_channel_weight", 1.0))
 
         # create sequence mask
         if not ignore_speech_gen and 'target_audio' in batch:
@@ -1015,7 +1099,10 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
     def training_step(self, batch: dict, batch_idx: int):
         ignore_speech_gen = self.cfg.get("ignore_speech_gen", None)
         
-        for m in (self.perception.preprocessor, self.perception.encoder, self.llm):  
+        for m in (
+            self.perception.preprocessor, self.perception.encoder,
+            self.llm, self.lm_head, self.embed_tokens
+        ):  
             if is_frozen(m):
                 m.eval()
         if not ignore_speech_gen and is_frozen(self.speech_generation):
@@ -1118,7 +1205,8 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             loss = self.cfg.text_loss_weight * text_loss 
             if not ignore_speech_gen and 'target_audio' in batch:
                 loss += self.cfg.audio_loss_weight * audio_loss
-
+                
+            # Prepare output ans
             B, T = inputs["input_embeds"].shape[:2]
             ans = {
                 "loss": loss,
@@ -1353,9 +1441,14 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         """
 
         """
-        if self.system_prompt is not None:
+        if self.system_prompt is not None or self.use_chat_template:
+            prompt_ids = []
+            if self.system_prompt is not None:
+               prompt_ids += self.system_prompt_ids
+            if self.use_chat_template:   
+                prompt_ids += self.user_start_ids           
             text_bos = torch.tensor(
-                    self.system_prompt_ids,
+                    prompt_ids,
                     dtype=torch.long, 
                     device=self.device
             )
@@ -1371,6 +1464,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         input_signal: torch.Tensor,
         input_signal_lens: torch.Tensor,
         decode_audio: bool = True,
+        input_text: torch.Tensor | None = None
     ) -> dict[str, torch.Tensor]:
         """
         Autoregressive prediction.
@@ -1400,9 +1494,14 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             input_signal = resample(input_signal, sr, self.source_sample_rate)
             input_signal_lens = torch.tensor([input_signal.size(-1)]).to(device)
 
-        source_encoded, lengths, asr_emb = self.perception(
-            input_signal=input_signal, input_signal_length=input_signal_lens, return_encoder_emb=True
-        )
+        if input_text is not None:  # Forced text input mode
+            source_encoded = self.embed_tokens(input_text)
+            lengths = torch.full((source_encoded.shape[0],), fill_value=source_encoded.shape[1], device=self.device)
+            asr_emb = None
+        else:
+            source_encoded, lengths, asr_emb = self.perception(
+                input_signal=input_signal, input_signal_length=input_signal_lens, return_encoder_emb=True
+            )
         B, T_local, H = source_encoded.shape
         
         # Zero-pad during system prompt: now done in data loader
@@ -1448,10 +1547,11 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         if not ignore_speech_gen:
             self.speech_generation.reset_input_and_kv_cache(use_cache=True)
             gen_audio = torch.empty(B, T, self._num_codebooks, device=self.device, dtype=torch.long)
+        
         gen_text = torch.empty(B, T, device=self.device, dtype=torch.long)
 
         # -- First step, use init tokens  -------        
-        if self.system_prompt is not None:
+        if self.system_prompt is not None or self.use_chat_template:
             init_seq = self._get_bos_embedding()
             input_embeds[:, :init_seq.shape[0]] = init_seq
         else:
@@ -1488,6 +1588,17 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         # Autoregressive loop
         for t in range(1, T):
             last_emb = self.embed_tokens(gen_text[:, t - 1])
+            if True: # !!!!! DEBUGGING !!!  TODO: add config var to select this
+                agent_padding_pos = gen_text[:, t - 1].eq(self.text_pad_id)
+                if input_text is not None:
+                    user_padding_pos = input_text.eq(self.text_pad_id)
+                    padding_pos = user_padding_pos & ~agent_padding_pos
+                    agent_padding_pos = agent_padding_pos & ~user_padding_pos
+                    
+                    input_embeds[:, t] = input_embeds[:, t].masked_fill(padding_pos.unsqueeze(-1), 0.0)
+  
+                last_emb = last_emb.masked_fill(agent_padding_pos.unsqueeze(-1), 0.0)
+
             input_embeds[:, t] += last_emb
 
             if not ignore_speech_gen:

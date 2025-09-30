@@ -36,8 +36,6 @@ from typing import Tuple
 MIN_FRAMES_FOR_TEXT = 3
 
 
-
-
 def first_nonzero_idx_torch(x: torch.Tensor, zero_value: int = 0, none_value: int = -1):
     # x: LongTensor/FloatTensor of shape (B, T)
     mask = x != zero_value                 # (B, T) boolean
@@ -114,6 +112,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         use_word_pad: bool = False,
         use_alignment_items: bool = False,
         system_prompt: str | None = None,
+        use_chat_template: bool = False
     ):
         self.tokenizer = tokenizer
         self.use_word_pad = use_word_pad
@@ -125,6 +124,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         self.text_max_tokens = text_max_tokens
         self.use_alignment_items = use_alignment_items
         self.system_prompt = system_prompt
+        self.use_chat_template = use_chat_template
 
         assert tokenizer.bos is not None, "BOS support in the tokenizer is required for S2S models."
         assert tokenizer.eos is not None, "EOS support in the tokenizer is required for S2S models."
@@ -148,7 +148,13 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
             [] if self.system_prompt is None 
             else get_system_prompt_ids(self.tokenizer, self.system_prompt)
         )
-        offset = len(system_tokens)
+        n_system_tokens = len(system_tokens)
+        offset = n_system_tokens
+                          
+        user_start_tokens = get_chat_start_ids(self.tokenizer, is_agent=False)
+        if self.use_chat_template:  
+            # Make room for user start tokens possibly to be added before agent turn
+            offset += len(user_start_tokens)
         
         source_audio, source_audio_lens = collate_audio(cuts.resample(self.source_sample_rate))
         if offset > 0:
@@ -172,12 +178,16 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         target_tokens, target_token_lens = collate_token_channel(
             cuts, self.tokenizer, self.frame_length, roles=self.output_roles,
             use_alignment_items=self.use_alignment_items,
-            use_word_pad=self.use_word_pad
+            use_word_pad=self.use_word_pad,
+            use_chat_template=self.use_chat_template,
+            is_agent=True
         )
         source_tokens, source_token_lens = collate_token_channel(
             cuts, self.tokenizer, self.frame_length, roles=self.input_roles,
             use_alignment_items=self.use_alignment_items,
-            use_word_pad=self.use_word_pad
+            use_word_pad=self.use_word_pad,
+            use_chat_template=self.use_chat_template,
+            is_agent=False
         )
         
         if offset > 0:
@@ -199,14 +209,19 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
             )
             # Insert in the sequences    
             for idx in range(B):
-                if target_first_positions[idx] < source_first_positions[idx]: 
+                if (t_pos := target_first_positions[idx]) < (s_pos := source_first_positions[idx]):   
+                    if self.use_chat_template:
+                        # Agent first not OK, add empty user turn
+                        prefix_tokens =  system_tokens + user_start_tokens # type: ignore
+                    else:
+                        prefix_tokens = system_tokens
                     target_tokens[idx, :offset] = torch.tensor(
-                        system_tokens,
+                        prefix_tokens,
                         dtype=target_tokens.dtype
                     )
-                else:
+                else: # User first, add system prompt and padding to correspond to audio above
                     source_tokens[idx, :offset] = torch.tensor(
-                        system_tokens,
+                        system_tokens + [pad_id]*len(user_start_tokens),
                         dtype=source_tokens.dtype
                     )
          
@@ -461,7 +476,19 @@ def get_word_pad_ids(tokenizer: TokenizerSpec):
     # TODO: move the token list to config
     return tokenizer.tokenizer.convert_tokens_to_ids(
         ["<|wd_pad_id|>", "<|wd_epad_id|>"]
-    ) 
+    )
+
+
+def get_chat_start_ids(tokenizer: TokenizerSpec, is_agent: bool):
+    # TODO: move the token list to config
+    if is_agent:
+        return tokenizer.tokenizer.convert_tokens_to_ids(
+            ['<|start_header_id|>', 'assistant', '<|end_header_id|>']
+        )
+    else:
+        return tokenizer.tokenizer.convert_tokens_to_ids(
+            ['<|start_header_id|>', 'user', '<|end_header_id|>']
+        )
 
        
 def get_system_prompt_ids(tokenizer: TokenizerSpec, system_prompt: str):
@@ -479,14 +506,21 @@ def collate_token_channel(
     frame_length: Seconds,
     roles: set[str],
     use_alignment_items: bool = False,
-    use_word_pad: bool = False
-) -> tuple[torch.Tensor, torch.Tensor]:
+    use_word_pad: bool = False,
+    use_chat_template: bool = False,
+    is_agent: bool = False
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     
     pad_id = get_pad_id(tokenizer)
     if use_word_pad:
         word_pad_id, word_epad_id = get_word_pad_ids(tokenizer)
     else:
         word_pad_id = word_epad_id = pad_id
+        
+    if use_chat_template:
+        chat_start_ids = get_chat_start_ids(tokenizer, is_agent)
+    else:
+        chat_start_ids = None
     
     tokens = [
         build_token_channel(
@@ -494,7 +528,8 @@ def collate_token_channel(
             pad_id=pad_id,
             use_alignment_items=use_alignment_items,
             word_pad_id=word_pad_id,
-            word_epad_id=word_epad_id
+            word_epad_id=word_epad_id,
+            chat_start_ids=chat_start_ids
         )
         for c in cuts
     ]
@@ -587,7 +622,8 @@ def build_token_channel(
         pad_id: int = -1,
         use_alignment_items: bool = False,
         word_pad_id: int = -2,
-        word_epad_id: int = -3
+        word_epad_id: int = -3,
+        chat_start_ids: list[int] | None = None,
 ) -> torch.Tensor:
     diagnostic = f"Extra info: {cut.id=}"
     if getattr(cut, "shard_origin", None) is not None:
@@ -639,7 +675,12 @@ def build_token_channel(
                 else:  # more text than expected, we should still force an eos
                     tokens[-1] = tokenizer.eos
             else:
-                text_ids = torch.as_tensor([tokenizer.bos] + tokenizer.text_to_ids(supervision.text))
+                if chat_start_ids is None:
+                    prefix_ids = [tokenizer.bos]
+                else:
+                    prefix_ids = chat_start_ids
+                        
+                text_ids = torch.as_tensor(prefix_ids + tokenizer.text_to_ids(supervision.text)) # type: ignore
 
                 if start_pos >= len(tokens):  # Changed from > to >= for robustness
                     logging.warning(
