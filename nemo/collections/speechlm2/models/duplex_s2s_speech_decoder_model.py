@@ -441,12 +441,35 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
     @property
     def system_prompt_ids(self) -> Tensor:
         system_prompt = self.cfg.get("system_prompt", "")
-        return self.tokenizer.tokenizer.convert_tokens_to_ids(
-            ['<|begin_of_text|>', '<|start_header_id|>'] +
-            ['system', '<|end_header_id|>'] +
-            self.tokenizer.tokenizer.tokenize(system_prompt) +
-            ['<|eot_id|>']
-        )
+        if "Nemotron" in self.cfg.pretrained_llm:
+            if "v1" in self.cfg.pretrained_llm:
+                system_prompt_ids = self.tokenizer.tokenizer.convert_tokens_to_ids(
+                    ['<|begin_of_text|>', '<|start_header_id|>'] +
+                    ['system', '<|end_header_id|>'] +
+                    self.tokenizer.tokenizer.tokenize(system_prompt) +
+                    ['<|eot_id|>']
+                )
+            elif "v2" in self.cfg.pretrained_llm:
+                if "/no_think" in system_prompt:
+                    self.reasoning = False
+                    system_prompt.replace("/no_think", "")
+                elif "/think" in system_prompt:
+                    self.reasoning = True
+                    system_prompt.replace("/think", "")
+                else:
+                    self.reasoning = False
+
+                """
+                Prompt Format:
+                self.reasoning = False:
+                ['<SPECIAL_10>', 'System', '\\n', system_prompt, '\\n', '<SPECIAL_11>', 'User', '\\n', user_prompt, '\\n', '<SPECIAL_11>', 'Assistant', '\\n', '<think>', '</think>']
+                self.reasoning = True:
+                ['<SPECIAL_10>', 'System', '\\n', system_prompt, '\\n', '<SPECIAL_11>', 'User', '\\n', user_prompt, '\\n', '<SPECIAL_11>', 'Assistant', '\\n', '<think>']
+                """
+                system_prompt_ids = self.tokenizer.tokenizer.convert_tokens_to_ids(
+                    ['<SPECIAL_10>', 'System', '\\n', self.tokenizer.tokenizer.tokenize(system_prompt), '\\n', '<SPECIAL_11>', 'User', '\\n']
+                )
+        return system_prompt_ids
 
     def forward(
         self,
@@ -1366,7 +1389,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         """
         if self.system_prompt is not None:
             text_bos = torch.tensor(
-                    self.system_prompt_ids,
+                    self.system_prompt_ids(),
                     dtype=torch.long, 
                     device=self.device
             )
