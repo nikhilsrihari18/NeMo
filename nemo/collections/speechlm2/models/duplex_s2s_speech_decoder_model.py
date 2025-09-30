@@ -671,7 +671,6 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             (2) Remove audio codec embedding from 'input_embeds'
             ...
         """
-        self.ignore_speech_gen = self.cfg.get("self.ignore_speech_gen", None)
         
         # check if audios has the same batch size
         if 'target_audio' in batch:
@@ -1026,7 +1025,6 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
 
 
     def training_step(self, batch: dict, batch_idx: int):
-        self.ignore_speech_gen = self.cfg.get("self.ignore_speech_gen", None)
         
         for m in (self.perception.preprocessor, self.perception.encoder, self.llm):  
             if is_frozen(m):
@@ -1155,7 +1153,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
     def on_train_epoch_start(self) -> None:
         setup_audio_codec(self)  # potentially reloads the audio codec to make sure it's in fp32
         if (
-            not self.cfg.get("self.ignore_speech_gen", None) and
+            not self.ignore_speech_gen and
             hasattr(self.speech_generation, "use_speaker_encoder") and 
             self.speech_generation.use_speaker_encoder
         ):
@@ -1165,7 +1163,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         self.on_train_epoch_start()
         self.results_logger = ResultsLogger(self.validation_save_path).reset()
 
-        if not self.cfg.get("self.ignore_speech_gen", None):
+        if not self.ignore_speech_gen:
             self.asr_bleu = ASRBLEU(self.cfg.scoring_asr).reset()
         
         self.bleu = BLEU().reset()
@@ -1247,7 +1245,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         self.validation_results.clear()
 
     def on_validation_epoch_end(self, prefix="val") -> None:
-        if not self.cfg.get("self.ignore_speech_gen", None):
+        if not self.ignore_speech_gen:
             asr_bleu = self.asr_bleu.compute()
             for k, m in asr_bleu.items():
                 self.log(f"{prefix}_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
@@ -1279,7 +1277,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
 
         # Update speaker embedding to reflect the one in the prompt during inference
         if (
-            not self.cfg.get("self.ignore_speech_gen", None) and
+            not self.ignore_speech_gen and
             self.speech_generation.use_speaker_encoder and 
             self.speech_generation.inference_speaker_reference
         ):
@@ -1308,7 +1306,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             # Get ASR hypotheses for the generated audio
             # torchaudio resample is fragile to bfloat16 default dtype as well
             with fp32_precision():  # resample is fragile to bfloat16 default dtype
-                if not self.cfg.get("self.ignore_speech_gen", None):
+                if not self.ignore_speech_gen:
                     asr_hyps = self.asr_bleu.update(
                         name=name,
                         refs=dataset_batch["target_texts"],
@@ -1402,7 +1400,6 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 * "audio": generated waveform of shape (B, T3) (`decode_audio=True`).
                 * "audio_len" output lengths as number of waveform samples of shape (B,) (when `decode_audio=True`).
         """
-        self.ignore_speech_gen = self.cfg.get("self.ignore_speech_gen", None)
         if self.ignore_speech_gen:
             gen_audio = None
             
@@ -1755,7 +1752,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             self.llm = fully_shard(self.llm, **fsdp_config)
             self.lm_head = fully_shard(self.lm_head, **fsdp_config)
             self.perception = fully_shard(self.perception, **fsdp_config)
-            if not self.cfg.get("self.ignore_speech_gen", None):
+            if not self.ignore_speech_gen:
                 self.speech_generation = fully_shard(self.speech_generation, **fsdp_config)
 
     def generate_silence_tokens(self, time_steps: int, num_codebooks: int) -> torch.Tensor:
