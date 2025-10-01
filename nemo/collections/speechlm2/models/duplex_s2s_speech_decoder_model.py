@@ -211,10 +211,10 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         self.advance_text_channel_by = self.cfg.get("advance_text_channel_by", None)
         
         # apply chat template
-        self.use_chat_template = self.cfg.get("llm", {}).get("use_chat_template", None)
+        self.use_chat_template = self.cfg.get("use_chat_template", None)
         
         # handle system prompt    
-        self.system_prompt = self.cfg.get("llm", {}).get("system_prompt", None)
+        self.system_prompt = self.cfg.get("system_prompt", None)
         if self.system_prompt and self.advance_text_channel_by:
             raise ValueError("\nYou cannot use advance_text_channel_by with system_prompt or you could delete part of it!!!\n")
     
@@ -304,6 +304,15 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         if not self.ignore_speech_gen and self.cfg.get("pretrained_tts_from_s2s", None):
             self.init_speech_generation_from_another_s2s_checkpoint(self.cfg.pretrained_tts_from_s2s)
 
+        """
+        self.embed_audio_tokens = torch.nn.ModuleList(
+            [
+                torch.nn.Embedding(self.speech_vocab_size, self.embed_tokens.embedding_dim)
+                for _ in range(self._num_codebooks)
+            ]
+        )
+        self.audio_head = torch.nn.Linear(self.llm.config.hidden_size, self.speech_vocab_size * self._num_codebooks)
+        """
         # cached for quicker audio decoding
         self.register_buffer(
             "_control_codes",
@@ -463,13 +472,15 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         
     @property
     def system_prompt_ids(self) -> Tensor:
+        system_prompt = self.cfg.get("system_prompt", "")
         return self.tokenizer.tokenizer.convert_tokens_to_ids(
             ['<|begin_of_text|>', '<|start_header_id|>'] +
             ['system', '<|end_header_id|>'] +
-            self.tokenizer.tokenizer.tokenize(self.system_prompt) +
+            self.tokenizer.tokenizer.tokenize(system_prompt) +
             ['<|eot_id|>']
         )
     
+
     def forward(
         self,
         input_embeds: Tensor,
@@ -1436,12 +1447,15 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         return self.validation_step(*args, **kwargs)
 
     def _get_bos_embedding(self) -> torch.Tensor:
+        """
+
+        """
         if self.system_prompt is not None or self.use_chat_template:
             prompt_ids = []
             if self.system_prompt is not None:
                prompt_ids += self.system_prompt_ids
             if self.use_chat_template:   
-                prompt_ids += self.user_start_ids
+                prompt_ids += self.user_start_ids           
             text_bos = torch.tensor(
                     prompt_ids,
                     dtype=torch.long, 
