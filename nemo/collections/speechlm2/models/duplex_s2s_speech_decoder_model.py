@@ -480,7 +480,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             ['<|eot_id|>']
         )
     
-
+    
     def forward(
         self,
         input_embeds: Tensor,
