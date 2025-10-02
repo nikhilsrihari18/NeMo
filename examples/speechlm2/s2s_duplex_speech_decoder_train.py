@@ -26,7 +26,8 @@ torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
 
 # @hydra_runner(config_path="conf", config_name="s2s_duplex_speech_decoder")
 # @hydra_runner(config_path="/workspace/studies/s013_word-alignment/e001_model-dev", config_name="Llama-3.1-Nemotron-Nano-8B-v1_wd-align")
-@hydra_runner(config_path="/workspace/studies/s013_word-alignment/e001_model-dev", config_name="Llama-3.1-Nemotron-Nano-8B-v1_sys-prompt")
+# @hydra_runner(config_path="/workspace/studies/s013_word-alignment/e001_model-dev", config_name="Llama-3.1-Nemotron-Nano-8B-v1_sys-prompt")
+@hydra_runner(config_path="/workspace/studies/s002_duplex-force-align/e002_user-asr_v2", config_name="s2s_config")
 def train(cfg):
     OmegaConf.resolve(cfg)
     torch.distributed.init_process_group(backend="nccl")
@@ -44,6 +45,7 @@ def train(cfg):
     use_word_pad = cfg.model.tokenizer.get("use_word_pad", None)
     use_alignment_items = cfg.data.get("use_alignment_items", None)
     system_prompt = cfg.model.get("system_prompt", None)
+    use_chat_template = cfg.model.get("use_chat_template", None)
     
     dataset = DuplexS2SDataset(
         tokenizer=model.tokenizer,
@@ -54,7 +56,8 @@ def train(cfg):
         output_roles=cfg.data.output_roles,
         use_word_pad=use_word_pad,
         use_alignment_items=use_alignment_items,
-        system_prompt=system_prompt
+        system_prompt=system_prompt,
+        use_chat_template=use_chat_template
     )
     datamodule = DataModule(cfg.data, tokenizer=model.tokenizer, dataset=dataset)
 

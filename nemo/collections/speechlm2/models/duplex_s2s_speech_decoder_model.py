@@ -40,6 +40,7 @@ from torch.distributed.tensor.parallel import (
     parallelize_module,
 )
 from torch.nn.utils.rnn import pad_sequence
+from transformers import DynamicCache
 
 from nemo.collections.audio.parts.utils.resampling import resample
 from nemo.collections.common.tokenizers import AutoTokenizer
@@ -459,26 +460,42 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         return self.tokenizer.tokenizer.convert_tokens_to_ids("assistant")
     
     @property
-    def user_start_ids(self) -> Tensor:
-        return self.tokenizer.tokenizer.convert_tokens_to_ids(
-            ['<|start_header_id|>', 'user', '<|end_header_id|>']
-        )
+    def user_start_ids(self, version: str = 'v2') -> Tensor:
+        if version == 'v2':
+            return self.tokenizer.tokenizer.convert_tokens_to_ids(
+                ['<SPECIAL_11>', 'User', 'Ċ']
+            )
+        else:
+            return self.tokenizer.tokenizer.convert_tokens_to_ids(
+                ['<|start_header_id|>', 'user', '<|end_header_id|>']
+            )
     
     @property
-    def assistant_start_ids(self) -> Tensor:
-        return self.tokenizer.tokenizer.convert_tokens_to_ids(
-            ['<|start_header_id|>', 'assistant', '<|end_header_id|>']
-        )
+    def assistant_start_ids(self, version: str = 'v2') -> Tensor:
+        if version == 'v2':
+            return self.tokenizer.tokenizer.convert_tokens_to_ids(
+                ['<SPECIAL_11>', 'Assistant', 'Ċ', '<th', 'ink', '></', 'think', '>']
+            )
+        else:
+            return self.tokenizer.tokenizer.convert_tokens_to_ids(
+                ['<|start_header_id|>', 'assistant', '<|end_header_id|>']
+            )
         
     @property
-    def system_prompt_ids(self) -> Tensor:
+    def system_prompt_ids(self, version: str = 'v2') -> Tensor:
         system_prompt = self.cfg.get("system_prompt", "")
-        return self.tokenizer.tokenizer.convert_tokens_to_ids(
-            ['<|begin_of_text|>', '<|start_header_id|>'] +
-            ['system', '<|end_header_id|>'] +
-            self.tokenizer.tokenizer.tokenize(system_prompt) +
-            ['<|eot_id|>']
+        if version == 'v2':
+            return self.tokenizer.tokenizer.convert_tokens_to_ids(
+                ['<SPECIAL_10>', 'System', 'ĊĊ']  +
+                self.tokenizer.tokenizer.tokenize(system_prompt) 
         )
+        else:
+            return self.tokenizer.tokenizer.convert_tokens_to_ids(
+                ['<|begin_of_text|>', '<|start_header_id|>'] +
+                ['system', '<|end_header_id|>'] +
+                self.tokenizer.tokenizer.tokenize(system_prompt) +
+                ['<|eot_id|>']
+            )
     
     
     def forward(

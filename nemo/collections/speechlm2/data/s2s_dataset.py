@@ -479,25 +479,41 @@ def get_word_pad_ids(tokenizer: TokenizerSpec):
     )
 
 
-def get_chat_start_ids(tokenizer: TokenizerSpec, is_agent: bool):
-    # TODO: move the token list to config
-    if is_agent:
+def get_chat_start_ids(tokenizer: TokenizerSpec, is_agent: bool, version: str = 'v2'):
+    # TODO: use HF chat template to extract these
+    if version == 'v2':
+        if is_agent:
+            return tokenizer.tokenizer.convert_tokens_to_ids(
+                ['<SPECIAL_11>', 'Assistant', 'Ċ', '<th', 'ink', '></', 'think', '>']
+            )
+        else:
+            return tokenizer.tokenizer.convert_tokens_to_ids(
+                ['<SPECIAL_11>', 'User', 'Ċ']
+            )
+    else:
+        if is_agent:
+            return tokenizer.tokenizer.convert_tokens_to_ids(
+                ['<|start_header_id|>', 'assistant', '<|end_header_id|>']
+            )
+        else:
+            return tokenizer.tokenizer.convert_tokens_to_ids(
+                ['<|start_header_id|>', 'user', '<|end_header_id|>']
+            )
+
+        
+def get_system_prompt_ids(tokenizer: TokenizerSpec, system_prompt: str, version: str = 'v2'):
+    # TODO: use HF chat template to extract these
+    if version == 'v2':
         return tokenizer.tokenizer.convert_tokens_to_ids(
-            ['<|start_header_id|>', 'assistant', '<|end_header_id|>']
+            ['<SPECIAL_10>', 'System', 'ĊĊ'] +
+            tokenizer.tokenizer.tokenize(system_prompt) 
         )
     else:
         return tokenizer.tokenizer.convert_tokens_to_ids(
-            ['<|start_header_id|>', 'user', '<|end_header_id|>']
+            ['<|begin_of_text|>', '<|start_header_id|>', 'system', '<|end_header_id|>'] +
+            tokenizer.tokenizer.tokenize(system_prompt) +
+            ['<|eot_id|>']
         )
-
-       
-def get_system_prompt_ids(tokenizer: TokenizerSpec, system_prompt: str):
-    # TODO: move the token list to config
-    return tokenizer.tokenizer.convert_tokens_to_ids(
-        ['<|begin_of_text|>', '<|start_header_id|>', 'system', '<|end_header_id|>'] +
-         tokenizer.tokenizer.tokenize(system_prompt) +
-         ['<|eot_id|>']
-    )
 
     
 def collate_token_channel(
