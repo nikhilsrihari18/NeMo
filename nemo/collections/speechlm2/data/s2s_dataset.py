@@ -11,13 +11,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# flake8: noqa: E501, E302
+
 import re
 
 import torch
 import torch.utils.data
 import torchaudio
 
-from lhotse import CutSet, MonoCut, Recording, Seconds, SupervisionSegment, compute_num_frames
+from lhotse import CutSet, MonoCut, Recording, Seconds, SupervisionSegment, compute_num_frames, compute_num_samples
+from lhotse.supervision import AlignmentItem
 from lhotse.cut import Cut
 from lhotse.dataset.collation import collate_audio, collate_vectors
 from lhotse.utils import ifnone
@@ -26,6 +30,20 @@ from nemo.collections.common.tokenizers import TokenizerSpec
 from nemo.collections.speechlm2.data.utils import get_pad_id, collate_and_pad_1d, collate_and_pad_2d, collate_and_pad
 from nemo.utils import logging
 from nemo.collections.common.data.lhotse.text_adapters import Formattable
+
+from typing import Tuple
+
+MIN_FRAMES_FOR_TEXT = 3
+
+
+def first_nonzero_idx_torch(x: torch.Tensor, zero_value: int = 0, none_value: int = -1):
+    # x: LongTensor/FloatTensor of shape (B, T)
+    mask = x != zero_value                 # (B, T) boolean
+    idx = mask.float().argmax(dim=1)       # first True index (garbage if no True)
+    has = mask.any(dim=1)                  # (B,)
+    fill = torch.full_like(idx, none_value)
+    return torch.where(has, idx, fill)     # (B,) LongTensor
+
 
 class DuplexS2SDataset(torch.utils.data.Dataset):
     """
@@ -91,14 +109,22 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         input_roles: list[str] = None,
         output_roles: list[str] = None,
         text_max_tokens: int = 10000,
+        use_word_pad: bool = False,
+        use_alignment_items: bool = False,
+        system_prompt: str | None = None,
+        use_chat_template: bool = False
     ):
         self.tokenizer = tokenizer
+        self.use_word_pad = use_word_pad
         self.frame_length = frame_length
         self.source_sample_rate = source_sample_rate
         self.target_sample_rate = target_sample_rate
         self.input_roles = set(ifnone(input_roles, ["user"]))
         self.output_roles = set(ifnone(output_roles, ["agent"]))
         self.text_max_tokens = text_max_tokens
+        self.use_alignment_items = use_alignment_items
+        self.system_prompt = system_prompt
+        self.use_chat_template = use_chat_template
 
         assert tokenizer.bos is not None, "BOS support in the tokenizer is required for S2S models."
         assert tokenizer.eos is not None, "EOS support in the tokenizer is required for S2S models."
@@ -116,15 +142,89 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
     def __getitem__duplex__(self, cuts: CutSet) -> dict:
         cuts = cuts.transform_text(_strip_timestamps)
         is_s2t = getattr(cuts[0], "s2t", False)
-
+        pad_id = get_pad_id(self.tokenizer)
+        
+        system_tokens = (
+            [] if self.system_prompt is None 
+            else get_system_prompt_ids(self.tokenizer, self.system_prompt)
+        )
+        n_system_tokens = len(system_tokens)
+        offset = n_system_tokens
+                          
+        user_start_tokens = get_chat_start_ids(self.tokenizer, is_agent=False)
+        if self.use_chat_template:  
+            # Make room for user start tokens possibly to be added before agent turn
+            offset += len(user_start_tokens)
+        
         source_audio, source_audio_lens = collate_audio(cuts.resample(self.source_sample_rate))
+        if offset > 0:
+            n_extra_samples = compute_num_samples(
+                offset * self.frame_length,
+                self.source_sample_rate
+            )
+            source_audio = torch.cat(
+                [
+                    torch.zeros(
+                        source_audio.shape[0],
+                        n_extra_samples,
+                        device=source_audio.device,
+                        dtype=source_audio.dtype
+                    ),
+                    source_audio
+                ], dim=-1,
+            )
+            source_audio_lens += n_extra_samples
+        
         target_tokens, target_token_lens = collate_token_channel(
-            cuts, self.tokenizer, self.frame_length, roles=self.output_roles
+            cuts, self.tokenizer, self.frame_length, roles=self.output_roles,
+            use_alignment_items=self.use_alignment_items,
+            use_word_pad=self.use_word_pad,
+            use_chat_template=self.use_chat_template,
+            is_agent=True
         )
         source_tokens, source_token_lens = collate_token_channel(
-            cuts, self.tokenizer, self.frame_length, roles=self.input_roles
+            cuts, self.tokenizer, self.frame_length, roles=self.input_roles,
+            use_alignment_items=self.use_alignment_items,
+            use_word_pad=self.use_word_pad,
+            use_chat_template=self.use_chat_template,
+            is_agent=False
         )
         
+        if offset > 0:
+            # Add system prompt at the beginning of earliest among source and target
+            # Note: in our data, esp. real audio, the "agent" may start speaking before the "user"
+            B = target_tokens.shape[0]
+            target_first_positions = first_nonzero_idx_torch(target_tokens, pad_id)
+            source_first_positions = first_nonzero_idx_torch(source_tokens, pad_id)
+            
+            # Make room for system prompt at the beginning of the sequence
+            target_tokens = torch.cat(
+                [torch.full((B, offset), fill_value=pad_id, dtype=target_tokens.dtype), target_tokens],
+                dim=1
+            )
+            
+            source_tokens = torch.cat(
+                [torch.full((B, offset), fill_value=pad_id, dtype=target_tokens.dtype), source_tokens],
+                dim=1
+            )
+            # Insert in the sequences    
+            for idx in range(B):
+                if (t_pos := target_first_positions[idx]) < (s_pos := source_first_positions[idx]):   
+                    if self.use_chat_template:
+                        # Agent first not OK, add empty user turn
+                        prefix_tokens =  system_tokens + user_start_tokens # type: ignore
+                    else:
+                        prefix_tokens = system_tokens
+                    target_tokens[idx, :offset] = torch.tensor(
+                        prefix_tokens,
+                        dtype=target_tokens.dtype
+                    )
+                else: # User first, add system prompt and padding to correspond to audio above
+                    source_tokens[idx, :offset] = torch.tensor(
+                        system_tokens + [pad_id]*len(user_start_tokens),
+                        dtype=source_tokens.dtype
+                    )
+         
         # Common metadata processing
         metadata = []
         for id, cut in enumerate(cuts):
@@ -133,6 +233,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         # Base return dictionary with common fields
         result = {
             "sample_id": [str(cut.id) for cut in cuts],
+            #"n_system_tokens": offset,
             "source_audio": source_audio,
             "source_audio_lens": source_audio_lens,
             "target_tokens": target_tokens,
@@ -146,7 +247,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
             "metadata": metadata,
         }
 
-        # Speech to speech
+        # Speech to speech  
         if not is_s2t:
             target_audio, target_audio_lens = collate_audio(
                 cuts.resample(self.target_sample_rate), recording_field="target_audio"
@@ -163,7 +264,6 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
             })
 
         return result
-
 
 
     def __getitem__t2t_(self, cuts: CutSet) -> dict:
@@ -282,7 +382,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
             target_text_length = torch.as_tensor(len(target_text))
             return target_text, target_text_length, segment.text
 
-        # iterate over all cut in a batch
+        # iterate over all cuts in a batch
         for id, cut in enumerate(cuts):
             num_turns.append(len(cut.supervisions) - 1) # 1st supervision is system instruction
             # [TODO Check]
@@ -372,20 +472,71 @@ def collate_first_turn_audio(
     return collate_vectors(first_turn_audios, padding_value=0), torch.tensor(first_turn_audios_lens)
 
 
+def get_word_pad_ids(tokenizer: TokenizerSpec):
+    # TODO: move the token list to config
+    return tokenizer.tokenizer.convert_tokens_to_ids(
+        ["<|wd_pad_id|>", "<|wd_epad_id|>"]
+    )
+
+
+def get_chat_start_ids(tokenizer: TokenizerSpec, is_agent: bool):
+    # TODO: move the token list to config
+    if is_agent:
+        return tokenizer.tokenizer.convert_tokens_to_ids(
+            ['<|start_header_id|>', 'assistant', '<|end_header_id|>']
+        )
+    else:
+        return tokenizer.tokenizer.convert_tokens_to_ids(
+            ['<|start_header_id|>', 'user', '<|end_header_id|>']
+        )
+
+       
+def get_system_prompt_ids(tokenizer: TokenizerSpec, system_prompt: str):
+    # TODO: move the token list to config
+    return tokenizer.tokenizer.convert_tokens_to_ids(
+        ['<|begin_of_text|>', '<|start_header_id|>', 'system', '<|end_header_id|>'] +
+         tokenizer.tokenizer.tokenize(system_prompt) +
+         ['<|eot_id|>']
+    )
+
+    
 def collate_token_channel(
     cuts: CutSet,
     tokenizer: TokenizerSpec,
     frame_length: Seconds,
     roles: set[str],
-) -> tuple[torch.Tensor, torch.Tensor]:
+    use_alignment_items: bool = False,
+    use_word_pad: bool = False,
+    use_chat_template: bool = False,
+    is_agent: bool = False
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    
     pad_id = get_pad_id(tokenizer)
+    if use_word_pad:
+        word_pad_id, word_epad_id = get_word_pad_ids(tokenizer)
+    else:
+        word_pad_id = word_epad_id = pad_id
+        
+    if use_chat_template:
+        chat_start_ids = get_chat_start_ids(tokenizer, is_agent)
+    else:
+        chat_start_ids = None
+    
     tokens = [
-        build_token_channel(c, tokenizer=tokenizer, frame_length=frame_length, roles=roles, pad_id=pad_id)
+        build_token_channel(
+            c, tokenizer=tokenizer, frame_length=frame_length, roles=roles,
+            pad_id=pad_id,
+            use_alignment_items=use_alignment_items,
+            word_pad_id=word_pad_id,
+            word_epad_id=word_epad_id,
+            chat_start_ids=chat_start_ids
+        )
         for c in cuts
     ]
     token_lens = torch.tensor([len(tt) for tt in tokens])
     tokens = collate_vectors(tokens, padding_value=pad_id)
     return tokens, token_lens
+
 
 def collate_token_channel_fc(
     cuts: CutSet,
@@ -402,12 +553,77 @@ def collate_token_channel_fc(
     tokens = collate_vectors(tokens, padding_value=pad_id)
     return tokens, token_lens
 
+
+def build_aligned_tokens(
+    alignment: AlignmentItem,
+    item_index: int,
+    superv_start_pos: int,
+    tokenizer: TokenizerSpec,
+    frame_length: Seconds,
+    sampling_rate: int,
+    tokens_len: int,
+    diagnostic: str,
+    # pad_id: int = -1,
+    # use_alignment_items: bool = False,
+    # word_pad_id: int = -2,
+    # word_epad_id: int = -3
+) -> Tuple[torch.Tensor, int, int, bool]:
+    
+    text_overflow = False
+    if item_index == 0:  # first word in the sequence, add bos
+        text_ids = torch.as_tensor([tokenizer.bos] + tokenizer.text_to_ids(alignment.symbol))
+    else:  
+        # Add space before each word so it's tokenized similarly to a sentence. Note that token('<word>') != token(' <word>')
+        text_ids = torch.as_tensor(tokenizer.text_to_ids(" " + alignment.symbol))
+    
+    start_pos = compute_num_frames(alignment.start, frame_length, sampling_rate)
+    if superv_start_pos + start_pos >= tokens_len:
+        logging.warning(
+            f"Ill-constructed example: the beginning offset of a word {superv_start_pos + start_pos} is larger " \
+            f"than or equal to the example's length {tokens_len}. {diagnostic}\n"
+        )
+        text_overflow = True
+        return torch.empty(0), start_pos, start_pos, start_pos, text_overflow
+
+    eos_pos = compute_num_frames(alignment.end, frame_length, sampling_rate)
+    
+    available_frames_for_text = eos_pos - start_pos
+    # We leave some margin for short duration words (could be imperfect)
+    if available_frames_for_text < MIN_FRAMES_FOR_TEXT:
+        available_frames_for_text = MIN_FRAMES_FOR_TEXT
+        eos_pos = start_pos + MIN_FRAMES_FOR_TEXT
+          
+    if available_frames_for_text > 0 and len(text_ids) > available_frames_for_text:
+        # Truncate text_ids to fit before the eos position.
+        text_ids = text_ids[:available_frames_for_text]
+    elif available_frames_for_text <= 0:
+        # If there's no space for text (e.g., start >= end), use an empty sequence.
+        text_ids = torch.tensor([], dtype=torch.long)
+
+    end_pos = start_pos + len(text_ids)
+    
+    if end_pos + superv_start_pos > tokens_len:
+        trunc_len = superv_start_pos + end_pos - tokens_len
+        logging.warning(
+            f"Truncating training example's *word* text_ids of length {len(text_ids)} by {trunc_len} because end pos {end_pos + superv_start_pos} > {tokens_len=}. {diagnostic}\n"
+        )
+        text_ids = text_ids[:trunc_len]
+        end_pos = start_pos + len(text_ids) 
+        text_overflow = True 
+
+    return text_ids, start_pos, end_pos, eos_pos, text_overflow
+
+
 def build_token_channel(
         cut: Cut,
         tokenizer: TokenizerSpec,
         frame_length: Seconds,
         roles: set[str],
         pad_id: int = -1,
+        use_alignment_items: bool = False,
+        word_pad_id: int = -2,
+        word_epad_id: int = -3,
+        chat_start_ids: list[int] | None = None,
 ) -> torch.Tensor:
     diagnostic = f"Extra info: {cut.id=}"
     if getattr(cut, "shard_origin", None) is not None:
@@ -418,45 +634,94 @@ def build_token_channel(
 
     for supervision in cut.supervisions:
         if supervision.speaker in roles:
-            text_ids = torch.as_tensor([tokenizer.bos] + tokenizer.text_to_ids(supervision.text))
+            
+            start_pos = compute_num_frames(supervision.start, frame_length, cut.sampling_rate)
+            
+            if use_alignment_items and supervision.alignment is not None:
+                
+                prev_end_pos = 0
+                for idx, alignment in enumerate(supervision.alignment['word']):
+                    if alignment is None:
+                        logging.warning(
+                            f"Empty alignment found at index {idx} - info: {diagnostic}\n"
+                        )
+                        continue
+                    
+                    text_ids, w_start_pos, w_end_pos, w_eos_pos, text_overflow = build_aligned_tokens(
+                        alignment, idx, start_pos, tokenizer, frame_length, cut.sampling_rate, len(tokens),
+                        diagnostic, 
+                        # use_alignment_items=use_alignment_items,
+                        # pad_id=pad_id, word_pad_id=word_pad_id, word_epad_id=word_epad_id
+                    )                 
+                    if text_overflow:                        
+                        break
+                    try:
+                        if idx > 0:  # Add word padding tokens
+                            tokens[start_pos+prev_end_pos:start_pos+w_start_pos] = word_pad_id
+                        if idx > 0 and w_start_pos-1 > prev_end_pos:  # Add EAPD token
+                            tokens[start_pos+w_start_pos-1] = word_epad_id
+                            
+                        tokens[start_pos+w_start_pos:start_pos+w_end_pos] = text_ids
+                        
+                        prev_end_pos = w_end_pos
+                    except Exception as e:
+                        raise RuntimeError(
+                            f"{tokens.shape=} {start_pos+w_start_pos=} {start_pos+w_end_pos=} " \
+                            f"{text_ids.shape=} {diagnostic}"
+                        ) from e
 
-            pos = compute_num_frames(supervision.start, frame_length, cut.sampling_rate)
-            if pos >= len(tokens):  # Changed from > to >= for robustness
-                logging.warning(
-                    f"Ill-constructed example: the beginning offset of a supervision {pos} is larger than or equal to the example's length {len(tokens)}. {diagnostic}"
-                )
-                continue
+                if start_pos+w_eos_pos < len(tokens):
+                    tokens[start_pos+w_eos_pos] = tokenizer.eos
+                else:  # more text than expected, we should still force an eos
+                    tokens[-1] = tokenizer.eos
+            else:
+                if chat_start_ids is None:
+                    prefix_ids = [tokenizer.bos]
+                else:
+                    prefix_ids = chat_start_ids
+                        
+                text_ids = torch.as_tensor(prefix_ids + tokenizer.text_to_ids(supervision.text)) # type: ignore
 
+                if start_pos >= len(tokens):  # Changed from > to >= for robustness
+                    logging.warning(
+                        f"Ill-constructed example: the beginning offset of a supervision {start_pos} is larger than or equal to the example's length {len(tokens)}. {diagnostic}\n"
+                    )
+                    continue
 
-            eospos = compute_num_frames(supervision.end, frame_length, cut.sampling_rate)
+                eos_pos = compute_num_frames(supervision.end, frame_length, cut.sampling_rate)
+                
+                # alignment info may be missing in some cases, e.g., when ASR failed
+                # if use_alignment_items and supervision.alignment is None:  
+                    # ...
+                    # Nothing to do
+                
+                available_frames_for_text = eos_pos - start_pos
+                if available_frames_for_text > 0 and len(text_ids) > available_frames_for_text:
+                    # Truncate text_ids to fit before the eos position.
+                    text_ids = text_ids[:available_frames_for_text]
+                elif available_frames_for_text <= 0:
+                    # If there's no space for text (e.g., start >= end), use an empty sequence.
+                    text_ids = torch.tensor([], dtype=torch.long)
 
+                end_pos = start_pos + len(text_ids)
+                if end_pos > len(tokens):
+                    trunc_len = len(tokens) - start_pos
+                    logging.warning(
+                        f"Truncating training example's text_ids of length {len(text_ids)} by " \
+                        f"{trunc_len} because {end_pos=} > {len(tokens)=}. {diagnostic}\n"
+                    )
+                    text_ids = text_ids[:trunc_len]
+                    end_pos = start_pos + len(text_ids)  
 
-            available_frames_for_text = eospos - pos
+                try:
+                    tokens[start_pos:end_pos] = text_ids
+                except Exception as e:
+                    raise RuntimeError(f"{tokens.shape=} {start_pos=} {end_pos=} {text_ids.shape=} {diagnostic}") from e
 
-
-            if available_frames_for_text > 0 and len(text_ids) > available_frames_for_text:
-                # Truncate text_ids to fit before the eos position.
-                text_ids = text_ids[:available_frames_for_text]
-            elif available_frames_for_text <= 0:
-                # If there's no space for text (e.g., start >= end), use an empty sequence.
-                text_ids = torch.tensor([], dtype=torch.long)
-
-            endpos = pos + len(text_ids)
-            if endpos > len(tokens):
-                trunc_len = len(tokens) - pos
-                logging.warning(
-                    f"Truncating training example's text_ids of length {len(text_ids)} by {trunc_len} because {endpos=} > {len(tokens)=}. {diagnostic}"
-                )
-                text_ids = text_ids[:trunc_len]
-                endpos = pos + len(text_ids)  
-
-            try:
-                tokens[pos:endpos] = text_ids
-            except Exception as e:
-                raise RuntimeError(f"{tokens.shape=} {pos=} {endpos=} {text_ids.shape=} {diagnostic}") from e
-
-            if eospos < len(tokens):
-                tokens[eospos] = tokenizer.eos
+                if eos_pos < len(tokens):
+                    tokens[eos_pos] = tokenizer.eos
+                else:  # more text than expected, we should still force an eos
+                    tokens[-1] = tokenizer.eos
 
     return tokens
 
