@@ -226,7 +226,7 @@ class CharAwareSubwordEncoder(NeuralModule):
 
         # Get average embedding over the chars
         mean_emb = ((x / char_mask.unsqueeze(-1).sum(1, keepdim=True)) * char_mask.unsqueeze(-1)).sum(1)
-        subword_emb = torch.zeros((subword_mask.size(0), subword_mask.size(1), mean_emb.size(-1)), device=device)
+        subword_emb = torch.zeros((subword_mask.size(0), subword_mask.size(1), mean_emb.size(-1)), device=device, dtype=mean_emb.dtype)
         subword_emb[subword_mask.unsqueeze(-1).expand(-1, -1, mean_emb.size(-1))] = mean_emb.view(-1)
 
         return subword_emb
@@ -426,6 +426,7 @@ class TransformerARSpeechDecoder(NeuralModule):
             speech_mask = torch.ones(
                 (speech_decoder_input.size(0), speech_decoder_input.size(1)),
                 device=speech_decoder_input.device,
+                dtype=speech_decoder_input.dtype
             )
 
         # if cond on text tokens, sum text tokens with the llm latent
