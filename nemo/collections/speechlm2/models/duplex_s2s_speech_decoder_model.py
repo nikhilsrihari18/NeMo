@@ -283,13 +283,19 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
 
         self.ignore_speech_gen = self.cfg.get("ignore_speech_gen", None)
         if not self.ignore_speech_gen:
-            self.speech_generation = TransformerARSpeechDecoder(
-                speech_decoder_parms=OmegaConf.to_container(self.cfg.speech_decoder),
-                lantent_dim=self.llm.config.hidden_size,
-                num_audio_codebooks=self._num_codebooks,
-                num_audio_tokens_per_codebook=self.speech_vocab_size,
-                llm_tokenizer_vocab_items=llm_tokenizer_vocab_items,
-            )
+            if self.cfg.get("speech_decoder", {}).get("_target_", None) == "TransformerARSpeechDecoder":
+                self.speech_generation = TransformerARSpeechDecoder(
+                    speech_decoder_parms=OmegaConf.to_container(self.cfg.speech_decoder),
+                    lantent_dim=self.llm.config.hidden_size,
+                    num_audio_codebooks=self._num_codebooks,
+                    num_audio_tokens_per_codebook=self.speech_vocab_size,
+                    llm_tokenizer_vocab_items=llm_tokenizer_vocab_items,
+                )
+            elif self.cfg.get("speech_decoder", {}).get("_target_", None) == "DuplexEARTTS":
+                from nemo.collections.speechlm2.modules.duplex_ear_tts import DuplexEARTTS
+                self.speech_generation = DuplexEARTTS(OmegaConf.to_container(self.cfg.speech_decoder, resolve=True))
+            else:
+                raise ValueError(f"Invalid speech decoder target: {self.cfg.get('speech_decoder', {}).get('_target_', None)}")
         else:
             self.speech_generation = None
 
@@ -304,15 +310,6 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         if not self.ignore_speech_gen and self.cfg.get("pretrained_tts_from_s2s", None):
             self.init_speech_generation_from_another_s2s_checkpoint(self.cfg.pretrained_tts_from_s2s)
 
-        """
-        self.embed_audio_tokens = torch.nn.ModuleList(
-            [
-                torch.nn.Embedding(self.speech_vocab_size, self.embed_tokens.embedding_dim)
-                for _ in range(self._num_codebooks)
-            ]
-        )
-        self.audio_head = torch.nn.Linear(self.llm.config.hidden_size, self.speech_vocab_size * self._num_codebooks)
-        """
         # cached for quicker audio decoding
         self.register_buffer(
             "_control_codes",
