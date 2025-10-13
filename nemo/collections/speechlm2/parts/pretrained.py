@@ -48,13 +48,13 @@ def load_pretrained_hf(model_path_or_name: str, pretrained_weights: bool = True,
     """
     if pretrained_weights:
         if "Nemotron" in model_path_or_name and "v2" in model_path_or_name:
-            return AutoModelForCausalLM.from_pretrained(model_path_or_name, torch_dtype=dtype, trust_remote_code=False)
+            return AutoModelForCausalLM.from_pretrained(model_path_or_name, torch_dtype=dtype, trust_remote_code=True)
         else:
             return AutoModelForCausalLM.from_pretrained(model_path_or_name, torch_dtype=dtype)
     else:
         config = AutoConfig.from_pretrained(model_path_or_name)
         if "Nemotron" in model_path_or_name and "v2" in model_path_or_name:
-            return AutoModelForCausalLM.from_config(config, torch_dtype=dtype, trust_remote_code=False)
+            return AutoModelForCausalLM.from_config(config, torch_dtype=dtype, trust_remote_code=True)
         else:
             return AutoModelForCausalLM.from_config(config, torch_dtype=dtype)
 
