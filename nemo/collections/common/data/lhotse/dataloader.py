@@ -14,7 +14,6 @@
 import os
 import random
 import warnings
-from copy import deepcopy
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, Optional, Sequence, Union
@@ -115,9 +114,6 @@ class LhotseDataLoadingConfig:
     token_equivalent_duration: float | None = None
     batch_tokens: int | None = None
     quadratic_factor: float | None = None
-    # Text pretraining data is usually very long, so we split it into smaller chunks.
-    # When provided, the text tokens will be cut into windows of this size.
-    cut_text_into_windows_tokens: int | None = None
 
     # 2.2 Filters on sequence lengths.
     #   * Speech input
@@ -206,6 +202,14 @@ class LhotseDataLoadingConfig:
     # * use map dataset for non-tarred audio data (we might change this in the future)
     force_map_dataset: bool = False
     force_iterable_dataset: bool = False
+    # Force the dataloader to slice each data source.
+    # This may improve sampling randomness for large-scale runs with many dataset sources and large shards
+    # at the cost of some IO redundancy.
+    # The slicing is achieved with a randomly-selected offset K used to skip the first K examples,
+    # and reading them consecutively for ``slice_length`` iterations.
+    # The first K examples will actually be read and then discarded, incurring the IO cost, due to
+    # our support of object stores and gzipped files that generally don't have indexes of byte offsets per line.
+    slice_length: Optional[int] = None
 
 
 def determine_use_iterable_dataset(use_iterable_dataset: bool, config: DictConfig) -> bool:
@@ -486,20 +490,6 @@ def get_lhotse_sampler_from_config(config, global_rank, world_size, tokenizer=No
                 "possibly impacting the training speed if your tokenizer is very large."
                 "If the impact is noticable, set pretokenize=False in dataloader config."
                 "(note: that will disable token-per-second filtering and 2D bucketing features)"
-            )
-
-        if config.use_multimodal_sampling and config.cut_text_into_windows_tokens is not None:
-            cuts = CutSet(
-                LazyFlattener(
-                    cuts.map(
-                        partial(
-                            _cut_text_into_windows,
-                            num_tokens=config.cut_text_into_windows_tokens,
-                            tokenizer=tokenizer,
-                        ),
-                        apply_fn=None,
-                    )
-                )
             )
 
         if config.prompt_format is not None:
@@ -874,27 +864,3 @@ def _select_channel(cut, channel_selector: int | str) -> list:
     else:
         # with_channels only defined on MultiCut
         return cut.with_channels(channel_idx)
-
-def _cut_text_into_windows(cut, num_tokens: int, tokenizer) -> list:
-    """Split cut.text into chunks of num_tokens, creating new cuts with copied attributes from the original cut.
-
-    This only applies to pretraining data without chat template.
-
-    Args:
-        cut: TextExample, the cut object containing text to split
-        num_tokens: The number of tokens per chunk
-        tokenizer: The tokenizer to use to convert tokens to text
-
-    Returns:
-        list: A list of new cut objects, each containing a chunk of tokens
-    """
-    tokens = tokenizer.text_to_ids(cut.text)
-    ans = []
-    for i in range(0, len(tokens), num_tokens):
-        new_cut = type(cut)(
-            text=tokenizer.ids_to_text(tokens[i : i + num_tokens]),
-            language=cut.language,
-            custom=deepcopy(cut.custom),
-        )
-        ans.append(new_cut)
-    return ans

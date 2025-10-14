@@ -11,13 +11,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# flake8: noqa: E501, E302
+
 import re
+from typing import Tuple
 
 import torch
 import torch.utils.data
-import torchaudio
+# import torchaudio
 
-from lhotse import CutSet, MonoCut, Recording, Seconds, SupervisionSegment, compute_num_frames
+from lhotse import CutSet, MonoCut, Recording, Seconds, SupervisionSegment, compute_num_frames, compute_num_samples
+from lhotse.supervision import AlignmentItem
 from lhotse.cut import Cut
 from lhotse.dataset.collation import collate_audio, collate_vectors
 from lhotse.utils import ifnone
@@ -26,6 +31,18 @@ from nemo.collections.common.tokenizers import TokenizerSpec
 from nemo.collections.speechlm2.data.utils import get_pad_id, collate_and_pad_1d, collate_and_pad_2d, collate_and_pad
 from nemo.utils import logging
 from nemo.collections.common.data.lhotse.text_adapters import Formattable
+
+MIN_FRAMES_FOR_TEXT = 3
+
+
+def first_nonzero_idx_torch(x: torch.Tensor, zero_value: int = 0, none_value: int = -1):
+    # x: LongTensor/FloatTensor of shape (B, T)
+    mask = x != zero_value                 # (B, T) boolean
+    idx = mask.float().argmax(dim=1)       # first True index (garbage if no True)
+    has = mask.any(dim=1)                  # (B,)
+    fill = torch.full_like(idx, none_value)
+    return torch.where(has, idx, fill)     # (B,) LongTensor
+
 
 class DuplexS2SDataset(torch.utils.data.Dataset):
     """
@@ -91,14 +108,28 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         input_roles: list[str] = None,
         output_roles: list[str] = None,
         text_max_tokens: int = 10000,
+        use_word_pad: bool = False,
+        use_alignment_items: bool = False,
+        system_prompt: str | None = None,
+        use_chat_template: bool = False,
+        user_only: bool = False,
+        delay_user_txt_by: int = 0,
+        model_version: str = 'v1'
     ):
         self.tokenizer = tokenizer
+        self.use_word_pad = use_word_pad
         self.frame_length = frame_length
         self.source_sample_rate = source_sample_rate
         self.target_sample_rate = target_sample_rate
         self.input_roles = set(ifnone(input_roles, ["user"]))
         self.output_roles = set(ifnone(output_roles, ["agent"]))
         self.text_max_tokens = text_max_tokens
+        self.use_alignment_items = use_alignment_items
+        self.system_prompt = system_prompt
+        self.use_chat_template = use_chat_template
+        self.user_only = user_only        
+        self.delay_user_txt_by = delay_user_txt_by
+        self.model_version = model_version
 
         assert tokenizer.bos is not None, "BOS support in the tokenizer is required for S2S models."
         assert tokenizer.eos is not None, "EOS support in the tokenizer is required for S2S models."
@@ -114,40 +145,167 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
             return self.__getitem__duplex__(cuts)
 
     def __getitem__duplex__(self, cuts: CutSet) -> dict:
-        cuts = cuts.transform_text(_strip_timestamps)
         is_s2t = getattr(cuts[0], "s2t", False)
-
-        source_audio, source_audio_lens = collate_audio(cuts.resample(self.source_sample_rate))
-        target_tokens, target_token_lens = collate_token_channel(
-            cuts, self.tokenizer, self.frame_length, roles=self.output_roles
-        )
-        source_tokens, source_token_lens = collate_token_channel(
-            cuts, self.tokenizer, self.frame_length, roles=self.input_roles
-        )
+        pad_id = get_pad_id(self.tokenizer)
         
+        if hasattr(cuts[0], 'formatter') and cuts[0].formatter == 'nemo_tarred_to_duplex':
+            data_format = "tars"
+            filtered_cuts = []
+            skipped_cuts = []
+            for cut in cuts:
+                if any(
+                    s.text.strip() for s in cut.supervisions if s.speaker in self.input_roles
+                ) and any(  # Ensure time stamps are present
+                    '<|' in s.text for s in cut.supervisions if s.speaker in self.input_roles
+                ):
+                    filtered_cuts.append(cut)
+                else:
+                    skipped_cuts.append(cut.id)
+            if skipped_cuts:
+                logging.warning(f"Skipped {len(skipped_cuts)} cuts with empty input text or no timestamps. Skipped cut ids: {', '.join(skipped_cuts)}")
+            if not filtered_cuts:
+                logging.warning(f"All cuts were filtered out! Original batch size: {len(cuts)}. Returning minimal valid batch to continue training.")
+                return self._create_minimal_batch()
+            cuts = CutSet.from_cuts(filtered_cuts)
+        else:
+            data_format = "shars"
+            cuts = cuts.transform_text(_strip_timestamps)
+        
+        system_tokens = (
+            [] if self.system_prompt is None 
+            else get_system_prompt_ids(self.tokenizer, self.system_prompt, version=self.model_version)
+        )
+        n_system_tokens = len(system_tokens)
+        offset = n_system_tokens
+                          
+        user_start_tokens = get_chat_start_ids(self.tokenizer, is_agent=False, version=self.model_version)
+        if self.use_chat_template:  
+            # Make room for user start tokens possibly to be added before agent turn
+            offset += len(user_start_tokens)
+        
+        source_audio, source_audio_lens = collate_audio(cuts.resample(self.source_sample_rate))
+        if offset > 0:
+            n_extra_samples = compute_num_samples(
+                offset * self.frame_length,
+                self.source_sample_rate
+            )
+            source_audio = torch.cat(
+                [
+                    torch.zeros(
+                        source_audio.shape[0],
+                        n_extra_samples,
+                        device=source_audio.device,
+                        dtype=source_audio.dtype
+                    ),
+                    source_audio
+                ], dim=-1,
+            )
+            source_audio_lens += n_extra_samples
+        
+        input_roles = None if self.user_only else self.input_roles
+        source_tokens, source_token_lens, source_activity = collate_token_channel(
+            cuts, self.tokenizer, self.frame_length, roles=input_roles,
+            use_alignment_items=self.use_alignment_items,
+            use_word_pad=self.use_word_pad,
+            use_chat_template=self.use_chat_template,
+            is_agent=False,
+            model_version=self.model_version,
+            data_format=data_format,
+            delay_user_txt_by=self.delay_user_txt_by
+        )
+        if not self.user_only:
+            target_tokens, target_token_lens, target_activity = collate_token_channel(
+                cuts, self.tokenizer, self.frame_length, roles=self.output_roles,
+                use_alignment_items=self.use_alignment_items,
+                use_word_pad=self.use_word_pad,
+                use_chat_template=self.use_chat_template,
+                is_agent=True,
+                model_version=self.model_version,
+                data_format=data_format, 
+                delay_user_txt_by=0
+            )
+        else:
+            target_tokens = torch.ones_like(source_tokens) * pad_id
+            target_token_lens = torch.zeros_like(source_token_lens)
+            target_activity = torch.zeros_like(source_activity)
+        
+        if offset > 0:
+            # Add system prompt at the beginning of earliest among source and target
+            # Note: in our data, esp. real audio, the "agent" may start speaking before the "user"
+            B = target_tokens.shape[0]
+            target_first_positions = first_nonzero_idx_torch(target_tokens, pad_id)
+            source_first_positions = first_nonzero_idx_torch(source_tokens, pad_id)
+            
+            # Make room for system prompt at the beginning of the sequence
+            # if any(source_first_positions <= offset) or any(target_first_positions <= offset):
+            target_tokens = torch.cat(
+                [torch.full((B, offset), fill_value=pad_id, dtype=target_tokens.dtype), target_tokens],
+                dim=1
+            )
+            target_activity = torch.cat(
+                [torch.full((B, offset), fill_value=0, dtype=target_activity.dtype), target_activity],
+                dim=1
+            )
+            
+            source_tokens = torch.cat(
+                [torch.full((B, offset), fill_value=pad_id, dtype=target_tokens.dtype), source_tokens],
+                dim=1
+            )
+            source_activity = torch.cat(
+                [torch.full((B, offset), fill_value=0, dtype=source_activity.dtype), source_activity],
+                dim=1
+            )
+            # Insert in the sequences    
+            for idx in range(B):
+                if (t_pos := target_first_positions[idx]) < (s_pos := source_first_positions[idx]):   
+                    if self.use_chat_template:
+                        # Agent first not OK, add empty user turn
+                        prefix_tokens =  system_tokens + user_start_tokens # type: ignore
+                    else:
+                        prefix_tokens = system_tokens
+                    target_tokens[idx, :offset] = torch.tensor(
+                        prefix_tokens,
+                        dtype=target_tokens.dtype
+                    )
+                else: # User first, add system prompt and padding to correspond to audio above
+                    source_tokens[idx, :offset] = torch.tensor(
+                        system_tokens + [pad_id]*len(user_start_tokens),
+                        dtype=source_tokens.dtype
+                    )
         # Common metadata processing
         metadata = []
         for id, cut in enumerate(cuts):
             metadata.append({'audio_filepath': cut.id + '.wav'})
 
+        if not self.user_only:
+            target_texts = [
+                " ".join(s.text for s in cut.supervisions if s.speaker in self.output_roles) for cut in cuts
+            ]
+        else:
+            target_texts = [''] * len(cuts)
+            
         # Base return dictionary with common fields
         result = {
             "sample_id": [str(cut.id) for cut in cuts],
             "source_audio": source_audio,
             "source_audio_lens": source_audio_lens,
+            "source_activity": source_activity,
             "target_tokens": target_tokens,
             "target_token_lens": target_token_lens,
+            "target_activity": target_activity,
             "source_tokens": source_tokens,
             "source_token_lens": source_token_lens,
-            "target_texts": [
-                " ".join(s.text for s in cut.supervisions if s.speaker in self.output_roles) for cut in cuts
-            ],
+            "target_texts": target_texts,
             "formatter": [getattr(cut, "formatter", "s2s_duplex") for cut in cuts],
             "metadata": metadata,
         }
 
-        # Speech to speech
-        if not is_s2t:
+        # Speech to speech  !!!!!!!!!!!! TODO
+        if False:  #not is_s2t:  !!!!!!!!!!!
+            # TODO(SE) This is failing on David AI in some cases because of this in collate_audio(...)
+            # [rank2]:     first_supervision = [s for s in cut.supervisions if s.speaker in roles][0]
+            # [rank2]:                         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^
+            # [rank2]: IndexError: list index out of range
             target_audio, target_audio_lens = collate_audio(
                 cuts.resample(self.target_sample_rate), recording_field="target_audio"
             )
@@ -165,6 +323,33 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         return result
 
 
+    def _create_minimal_batch(self) -> dict:
+        """Create a minimal valid batch when all cuts are filtered out."""
+        # Create minimal tensors with batch size 1
+        device = torch.device('cpu')  # Default device
+        
+        pad_id = get_pad_id(self.tokenizer)
+        
+        return {
+            "sample_id": ["empty_batch"],
+            "source_audio": torch.zeros((1, 16000), dtype=torch.float32),  # 1 second of silence at 16kHz
+            "source_audio_lens": torch.tensor([16000], dtype=torch.long),
+            "agent_bos_vad": None,
+            "target_audio": torch.zeros((1, 22050), dtype=torch.float32),  # 1 second of silence at 22.05kHz
+            "target_audio_lens": torch.tensor([22050], dtype=torch.long),
+            "target_tokens": torch.full((1, 50), pad_id, dtype=torch.long),
+            "target_activity": torch.full((1, 50), 1, dtype=torch.long),
+            "target_token_lens": torch.tensor([1], dtype=torch.long),
+            "source_tokens": torch.full((1, 50), pad_id, dtype=torch.long),
+            "source_activity": torch.full((1, 50), 1, dtype=torch.long),
+            "source_token_lens": torch.tensor([1], dtype=torch.long),
+            "source_texts": [""],
+            "target_texts": [""],
+            "all_texts": [""],
+            "target_first_turn_audio": torch.zeros((1, 22050), dtype=torch.float32),
+            "target_first_turn_audio_lens": torch.tensor([22050], dtype=torch.long),
+            "formatter": ["s2s_duplex"],
+        }
 
     def __getitem__t2t_(self, cuts: CutSet) -> dict:
         text_cuts = cuts.filter(lambda c: isinstance(c, Formattable))
@@ -282,7 +467,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
             target_text_length = torch.as_tensor(len(target_text))
             return target_text, target_text_length, segment.text
 
-        # iterate over all cut in a batch
+        # iterate over all cuts in a batch
         for id, cut in enumerate(cuts):
             num_turns.append(len(cut.supervisions) - 1) # 1st supervision is system instruction
             # [TODO Check]
@@ -372,20 +557,106 @@ def collate_first_turn_audio(
     return collate_vectors(first_turn_audios, padding_value=0), torch.tensor(first_turn_audios_lens)
 
 
+def get_word_pad_ids(tokenizer: TokenizerSpec):
+    # TODO: move the token list to config
+    return tokenizer.tokenizer.convert_tokens_to_ids(
+        ["<SPECIAL_985>", "<SPECIAL_986>"]
+        # ["<|wd_pad_id|>", "<|wd_epad_id|>"]
+    )
+
+
+def get_chat_start_ids(tokenizer: TokenizerSpec, is_agent: bool, version: str = 'v2'):
+    # TODO: use HF chat template to extract these
+    if version == 'v2':
+        if is_agent:
+            return tokenizer.tokenizer.convert_tokens_to_ids(
+                ['<SPECIAL_11>', 'Assistant', 'Ċ', '<th', 'ink', '></', 'think', '>']
+            )
+        else:
+            return tokenizer.tokenizer.convert_tokens_to_ids(
+                ['<SPECIAL_11>', 'User', 'Ċ']
+            )
+    elif version == 'v2-short':
+        if is_agent:
+            return tokenizer.tokenizer.convert_tokens_to_ids(
+                ['<SPECIAL_980>']
+            )
+        else:
+            return tokenizer.tokenizer.convert_tokens_to_ids(
+                ['<SPECIAL_990>']
+            )
+    else:
+        if is_agent:
+            return tokenizer.tokenizer.convert_tokens_to_ids(
+                ['<|start_header_id|>', 'assistant', '<|end_header_id|>']
+            )
+        else:
+            return tokenizer.tokenizer.convert_tokens_to_ids(
+                ['<|start_header_id|>', 'user', '<|end_header_id|>']
+            )
+
+        
+def get_system_prompt_ids(tokenizer: TokenizerSpec, system_prompt: str, version: str = 'v2'):
+    # TODO: use HF chat template to extract these
+    if version == 'v2':
+        return tokenizer.tokenizer.convert_tokens_to_ids(
+            ['<SPECIAL_10>', 'System', 'ĊĊ'] +
+            tokenizer.tokenizer.tokenize(system_prompt) 
+        )
+    else:
+        return tokenizer.tokenizer.convert_tokens_to_ids(
+            ['<|begin_of_text|>', '<|start_header_id|>', 'system', '<|end_header_id|>'] +
+            tokenizer.tokenizer.tokenize(system_prompt) +
+            ['<|eot_id|>']
+        )
+
+
 def collate_token_channel(
     cuts: CutSet,
     tokenizer: TokenizerSpec,
     frame_length: Seconds,
-    roles: set[str],
-) -> tuple[torch.Tensor, torch.Tensor]:
+    roles: set[str] | None,
+    use_alignment_items: bool = False,
+    use_word_pad: bool = False,
+    use_chat_template: bool = False,
+    is_agent: bool = False,
+    model_version: str = 'v1',
+    data_format: str = 'shars',
+    delay_user_txt_by: int = 0
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    
     pad_id = get_pad_id(tokenizer)
-    tokens = [
-        build_token_channel(c, tokenizer=tokenizer, frame_length=frame_length, roles=roles, pad_id=pad_id)
+    if use_word_pad:
+        word_pad_id, word_epad_id = get_word_pad_ids(tokenizer)
+    else:
+        word_pad_id = word_epad_id = pad_id
+        
+    if use_chat_template:
+        chat_start_ids = get_chat_start_ids(tokenizer, is_agent, version=model_version)
+    else:
+        chat_start_ids = None
+    
+    outputs = [
+        build_token_channel(
+            c, tokenizer=tokenizer, frame_length=frame_length, roles=roles,
+            pad_id=pad_id,
+            use_alignment_items=use_alignment_items,
+            word_pad_id=word_pad_id,
+            word_epad_id=word_epad_id,
+            chat_start_ids=chat_start_ids,
+            model_version=model_version, 
+            data_format=data_format,
+            delay_user_txt_by=delay_user_txt_by
+        )
         for c in cuts
     ]
+    tokens, activity_mask = map(list, zip(*outputs))
     token_lens = torch.tensor([len(tt) for tt in tokens])
     tokens = collate_vectors(tokens, padding_value=pad_id)
-    return tokens, token_lens
+    activity_mask = collate_vectors(activity_mask, padding_value=0)
+    
+    return tokens, token_lens, activity_mask
+
 
 def collate_token_channel_fc(
     cuts: CutSet,
@@ -402,63 +673,208 @@ def collate_token_channel_fc(
     tokens = collate_vectors(tokens, padding_value=pad_id)
     return tokens, token_lens
 
+
+def build_aligned_tokens(
+    alignment: AlignmentItem,
+    item_index: int,
+    superv_start_pos: int,
+    tokenizer: TokenizerSpec,
+    frame_length: Seconds,
+    sampling_rate: int,
+    tokens_len: int,
+    diagnostic: str
+) -> Tuple[torch.Tensor, int, int, bool]:
+    
+    text_overflow = False
+
+    # Add space before each word so it's tokenized similarly to a sentence. Note that token('<word>') != token(' <word>')
+    text_ids = torch.as_tensor(tokenizer.text_to_ids(" " + alignment.symbol))
+    
+    start_pos = compute_num_frames(alignment.start, frame_length, sampling_rate)
+    if superv_start_pos + start_pos >= tokens_len:
+        logging.warning(
+            f"Ill-constructed example: the beginning offset of a word {superv_start_pos + start_pos} is larger " \
+            f"than or equal to the example's length {tokens_len}. {diagnostic}\n"
+        )
+        text_overflow = True
+        return torch.empty(0), start_pos, start_pos, start_pos, text_overflow
+
+    eos_pos = compute_num_frames(alignment.end, frame_length, sampling_rate)
+    
+    available_frames_for_text = eos_pos - start_pos
+    # We leave some margin for short duration words (could be imperfect)
+    if available_frames_for_text < MIN_FRAMES_FOR_TEXT:
+        available_frames_for_text = MIN_FRAMES_FOR_TEXT
+        eos_pos = MIN_FRAMES_FOR_TEXT  
+          
+    if available_frames_for_text > 0 and len(text_ids) > available_frames_for_text:
+        # Truncate text_ids to fit before the eos position.
+        text_ids = text_ids[:available_frames_for_text]
+    elif available_frames_for_text <= 0:
+        # If there's no space for text (e.g., start >= end), use an empty sequence.
+        text_ids = torch.tensor([], dtype=torch.long)
+
+    end_pos = start_pos + len(text_ids)
+    
+    if end_pos + superv_start_pos > tokens_len:
+        trunc_len = superv_start_pos + end_pos - tokens_len
+        if len(text_ids) - trunc_len > 4:  # less verbose warning
+            logging.warning(
+                f"Truncating training example's *word* text_ids of length {len(text_ids)} to {trunc_len} because end pos {end_pos + superv_start_pos} > {tokens_len=}. {diagnostic}\n"
+            )
+        text_ids = text_ids[:trunc_len]
+        end_pos = start_pos + len(text_ids) 
+        text_overflow = True 
+
+    return text_ids, start_pos, end_pos, eos_pos, text_overflow
+
+
 def build_token_channel(
         cut: Cut,
         tokenizer: TokenizerSpec,
         frame_length: Seconds,
-        roles: set[str],
+        roles: set[str] | None,
         pad_id: int = -1,
-) -> torch.Tensor:
+        use_alignment_items: bool = False,
+        word_pad_id: int = -2,
+        word_epad_id: int = -3,
+        chat_start_ids: list[int] | None = None,
+        model_version: str | None = 'v1',
+        data_format: str = 'shars',
+        delay_user_txt_by: int = 0
+) -> Tuple[torch.Tensor, torch.Tensor]:
     diagnostic = f"Extra info: {cut.id=}"
     if getattr(cut, "shard_origin", None) is not None:
         diagnostic = f"{diagnostic} {cut.shard_origin=}"
 
     total = compute_num_frames(cut.duration, frame_length, cut.sampling_rate)
     tokens = torch.ones(total, dtype=torch.long) * pad_id
+    activity_mask = torch.zeros_like(tokens)
+    
+    agent_bos_id = get_chat_start_ids(tokenizer, True, version=model_version)
+    user_bos_id = get_chat_start_ids(tokenizer, False, version=model_version)
 
     for supervision in cut.supervisions:
-        if supervision.speaker in roles:
-            text_ids = torch.as_tensor([tokenizer.bos] + tokenizer.text_to_ids(supervision.text))
+        if roles is None or supervision.speaker in roles:
 
-            pos = compute_num_frames(supervision.start, frame_length, cut.sampling_rate)
-            if pos >= len(tokens):  # Changed from > to >= for robustness
-                logging.warning(
-                    f"Ill-constructed example: the beginning offset of a supervision {pos} is larger than or equal to the example's length {len(tokens)}. {diagnostic}"
+            start_pos = compute_num_frames(supervision.start, frame_length, cut.sampling_rate) + delay_user_txt_by
+            
+            if chat_start_ids is None:
+                prefix_ids = [tokenizer.bos]
+            else:
+                prefix_ids = chat_start_ids
+            
+            if use_alignment_items and supervision.alignment is not None:                
+                for idx, alignment in enumerate(supervision.alignment['word']):
+                    if alignment is None:
+                        logging.warning(f"Empty alignment found at index {idx} - info: {diagnostic}\n")
+                        continue
+                    
+                    text_ids, w_start_pos, w_end_pos, w_eos_pos, text_overflow = build_aligned_tokens( # type: ignore
+                        alignment, idx, start_pos, tokenizer, frame_length, cut.sampling_rate, len(tokens)-len(prefix_ids),
+                        diagnostic 
+                    )                
+                    if idx == 0:
+                        fst_pos = start_pos + len(prefix_ids) + w_start_pos
+                    if text_overflow:                        
+                        break
+                    try:
+                        i_start = start_pos + w_start_pos + len(prefix_ids)
+                        i_end = start_pos + w_end_pos + len(prefix_ids)
+                        tokens[i_start:i_end] = text_ids
+                    except Exception as e:
+                        raise RuntimeError(
+                            f"{tokens.shape=} {i_start=} {i_end=} " \
+                            f"{text_ids.shape=} {diagnostic}"
+                        ) from e
+
+                lst_pos = i_end + len(prefix_ids)
+                tokens[fst_pos:lst_pos] = _insert_word_padding(
+                    tokens[fst_pos:lst_pos],
+                    pad_id, word_pad_id, word_epad_id
                 )
-                continue
+                # Add bos tokens
+                fst_pos -= len(prefix_ids) 
+                tokens[fst_pos:fst_pos+len(prefix_ids)] = torch.as_tensor(prefix_ids, dtype=tokens.dtype, device=tokens.device)
 
+                # Add eos tokens
+                eos_pos = fst_pos + last_nonzero_index(tokens[fst_pos:lst_pos]) + 1 
+                
+                if eos_pos < len(tokens):
+                    tokens[eos_pos] = tokenizer.eos 
+                    # Keep padding within segments unmasked
+                    activity_mask[fst_pos:lst_pos] = 1
+                else:  # more text than expected, we should still force an eos
+                    tokens[-1] = tokenizer.eos
+                    # Keep padding within segments unmasked
+                    activity_mask[fst_pos:] = 1
+            else:
+                if start_pos >= len(tokens) + 4:  # +4 for less verbose warnings
+                    logging.warning(
+                        f"Ill-constructed example: the beginning offset of a supervision {start_pos} is larger than or equal to the example's length {len(tokens)}. {diagnostic}\n"
+                    )
+                    continue
 
-            eospos = compute_num_frames(supervision.end, frame_length, cut.sampling_rate)
+                eos_pos = compute_num_frames(supervision.end, frame_length, cut.sampling_rate) + delay_user_txt_by
+                available_frames_for_text = eos_pos - start_pos
+                
+                if data_format == 'shars':
+                    text_ids = torch.as_tensor(prefix_ids + tokenizer.text_to_ids(supervision.text)) # type: ignore
+                else:  # ASR tars  TODO: extract timestamps into alignmentItems and use code above to avoid two different versions
+                    if len(supervision.text) == 0:  
+                        continue
+                                        
+                    text_ids = torch.as_tensor(
+                        _text_to_ids(
+                            supervision.text, tokenizer,
+                            available_frames_for_text=available_frames_for_text,
+                            remove_timestamps=False, # type: ignore
+                            pad_id=pad_id,
+                            user_bos_id=user_bos_id,
+                            user_eos_id=agent_bos_id,
+                            threshold=None, eos_buffer=None
+                        )
+                    )
+                    text_ids = _insert_word_padding(text_ids, pad_id, word_pad_id, word_epad_id)
+                    
+                    text_ids = torch.cat([torch.as_tensor(prefix_ids), text_ids])
+                
+                if available_frames_for_text > 0 and len(text_ids) > available_frames_for_text:
+                    # Truncate text_ids to fit before the eos position.
+                    text_ids = text_ids[:available_frames_for_text]
+                elif available_frames_for_text <= 0:
+                    # If there's no space for text (e.g., start >= end), use an empty sequence.
+                    text_ids = torch.tensor([], dtype=torch.long)
 
+                end_pos = start_pos + len(text_ids)
+                if end_pos > len(tokens):
+                    trunc_len = len(tokens) - start_pos
+                    if delay_user_txt_by == 0:  # Avoid systematic warning
+                        logging.warning(
+                            f"Truncating training example's text_ids of length {len(text_ids)} to " \
+                            f"{trunc_len} because {end_pos=} > {len(tokens)=}. {diagnostic}\n"
+                        )
+                    text_ids = text_ids[:trunc_len]
+                    end_pos = start_pos + len(text_ids)  
 
-            available_frames_for_text = eospos - pos
+                try:
+                    tokens[start_pos:end_pos] = text_ids
+                    # Keep padding within segments unmasked
+                    activity_mask[max(start_pos-delay_user_txt_by-1,0):end_pos] = 1  # -delay_user_txt_by-1 to see the transition from padding to bos
+                except Exception as e:
+                    raise RuntimeError(f"{tokens.shape=} {start_pos=} {end_pos=} {text_ids.shape=} {diagnostic}") from e
 
+                eos_pos = start_pos + last_nonzero_index(tokens[start_pos:end_pos]) + 1 # NEW! 
 
-            if available_frames_for_text > 0 and len(text_ids) > available_frames_for_text:
-                # Truncate text_ids to fit before the eos position.
-                text_ids = text_ids[:available_frames_for_text]
-            elif available_frames_for_text <= 0:
-                # If there's no space for text (e.g., start >= end), use an empty sequence.
-                text_ids = torch.tensor([], dtype=torch.long)
+                if eos_pos < len(tokens):
+                    tokens[eos_pos] = tokenizer.eos
+                    activity_mask[eos_pos] = tokenizer.eos                    
+                else:  # more text than expected, we should still force an eos
+                    tokens[-1] = tokenizer.eos
+                    activity_mask[-1] = tokenizer.eos
 
-            endpos = pos + len(text_ids)
-            if endpos > len(tokens):
-                trunc_len = len(tokens) - pos
-                logging.warning(
-                    f"Truncating training example's text_ids of length {len(text_ids)} by {trunc_len} because {endpos=} > {len(tokens)=}. {diagnostic}"
-                )
-                text_ids = text_ids[:trunc_len]
-                endpos = pos + len(text_ids)  
+    return tokens, activity_mask
 
-            try:
-                tokens[pos:endpos] = text_ids
-            except Exception as e:
-                raise RuntimeError(f"{tokens.shape=} {pos=} {endpos=} {text_ids.shape=} {diagnostic}") from e
-
-            if eospos < len(tokens):
-                tokens[eospos] = tokenizer.eos
-
-    return tokens
 
 def _strip_timestamps(
     text: str, _TIMESTAMP_PATTERN=re.compile(r"<\|\d+\|>"), _SPACE_PATTERN=re.compile(r"\s+")
@@ -472,6 +888,7 @@ def _strip_timestamps(
     # Regexp pattern args are cached compiled patterns (micro-optimization).
     text = _TIMESTAMP_PATTERN.sub("", text)  # strip timestamp tokens if present
     return _SPACE_PATTERN.sub(" ", text).strip()  # strip multi-whitespaces
+
 
 def build_token_channel_fc(
     cut: Cut,
@@ -517,3 +934,149 @@ def build_token_channel_fc(
                 tokens[eospos] = tokenizer.eos
 
     return tokens
+
+
+def _text_to_ids(text: str, tokenizer: TokenizerSpec,
+                 _TIMESTAMP_PATTERN_STR=r"<\|(\d+)\|>",
+                 available_frames_for_text=None,
+                 word_align_position='left',
+                 remove_timestamps=False,
+                 pad_id=None,
+                 user_bos_id=None,
+                 user_eos_id=None,
+                 threshold=None,
+                 eos_buffer=None):
+    if not remove_timestamps and re.compile(_TIMESTAMP_PATTERN_STR).search(text):
+        text_ids = _text_with_timestamps_to_ids(text, tokenizer, _TIMESTAMP_PATTERN_STR, available_frames_for_text, word_align_position)
+    else:
+        _TIMESTAMP_PATTERN = re.compile(_TIMESTAMP_PATTERN_STR)
+        text = _TIMESTAMP_PATTERN.sub("", text)
+        # Remove extra spaces between words
+        text = " ".join(text.strip().split())
+        text_ids = tokenizer.text_to_ids(text)
+    return text_ids
+
+
+def _text_with_timestamps_to_ids(text: str, tokenizer: TokenizerSpec,
+                                 _TIMESTAMP_PATTERN_STR=r"<\|(\d+)\|>",
+                                 available_frames_for_text=None,
+                                 word_align_position='left') -> list[int]:
+    text_ids = []
+    text_ids, start_times, end_times, word_lens = _extract_text_and_time_tokens(text, tokenizer, _TIMESTAMP_PATTERN_STR)
+    text_ids_with_timestamps = _expand_text_with_timestamps_and_word_lengths(text_ids, word_lens, start_times, end_times, available_frames_for_text, frame_rate=0.08, pad_id=get_pad_id(tokenizer), word_align_position=word_align_position)
+    # logging.info(f'text_ids_with_timestamps: {text_ids_with_timestamps}')
+    # logging.info(f'text_ids: {text_ids}')
+    # logging.info(f'start_times: {start_times}')
+    # logging.info(f'end_times: {end_times}')
+    # logging.info(f'word_lens: {word_lens}')
+    return text_ids_with_timestamps
+
+
+def _extract_text_and_time_tokens(text, tokenizer: TokenizerSpec,
+                                 _TIMESTAMP_PATTERN_STR=r"<\|(\d+)\|>"):
+    # Find all time tokens
+    time_tokens = re.findall(_TIMESTAMP_PATTERN_STR, text)
+    start_time = [int(time_tokens[i]) for i in range(0, len(time_tokens), 2)]
+    end_time = [int(time_tokens[i]) for i in range(1, len(time_tokens), 2)]
+    # Remove all time tokens to isolate words
+    words = re.sub(_TIMESTAMP_PATTERN_STR, '', text).split()
+    # Process each word, tokenize it, and calculate token lengths
+    text_ids = []
+    word_lens = []
+    for i, word in enumerate(words):
+        word_with_space = word if i == 0 else ' ' + word
+        word_ids = tokenizer.text_to_ids(word_with_space)
+        word_len = len(word_ids)
+        text_ids.extend(word_ids)
+        word_lens.append(word_len)
+    return text_ids, start_time, end_time, word_lens
+
+
+def _expand_text_with_timestamps_and_word_lengths(
+        text_ids, word_lens, start_time, end_time, available_frames_for_text, frame_rate=0.08, pad_id=None, word_align_position='left'
+    ):    
+    """
+    Expand word tokens according to start time tokens and word lengths for a batch of sequences.
+
+    Args:
+    - word_tokens: List of text ids w/o timestamps
+    - word_lens: List of word lengths
+    - start_time: List of start times
+    - end_time: List of end times
+    - available_frames_for_text: Maximum number of frames for text
+    - frame_rate: Frame rate resolution
+    - pad_id: Padding ID to use for empty positions in the tensor
+
+    Returns:
+    - text ids with word-level timestamps
+    """
+
+    def discretize_time(start_token, speech_frame_rate=0.08, timestamp_frame_rate=0.08):
+        return int(start_token * timestamp_frame_rate / speech_frame_rate)
+
+    if pad_id is None:
+        raise ValueError("pad_id must be provided.")
+
+    max_length = available_frames_for_text
+
+    # Create the empty tensor with pad_id as the default value
+    text_ids_with_timestamps = [pad_id] * max_length
+
+    # Populate ids of each word starting at start_idx and ending at end_idx
+    cur_word_idx = 0  # Start frame index of current word
+    for word_idx, word_len in enumerate(word_lens):
+        start_idx = discretize_time(start_time[word_idx], speech_frame_rate=frame_rate)
+        end_idx = discretize_time(end_time[word_idx], speech_frame_rate=frame_rate)
+        if word_align_position == 'left':
+            end_idx = min(start_idx + word_len, end_idx)
+        elif word_align_position == 'right':
+            start_idx = max(start_idx, end_idx - word_len)
+        else:
+            raise ValueError(f"Unknown word_align_position: {word_align_position}")
+
+        # Get ids of a single word
+        word_ids = text_ids[cur_word_idx : cur_word_idx + word_len]
+
+        # Populate a single word
+        for i in range(start_idx, end_idx + 1):  # End inclusive at word level
+            if i - start_idx < len(word_ids) and i < max_length:
+                token_id = word_ids[i - start_idx]
+                text_ids_with_timestamps[i] = token_id
+
+        # Move to the next word in the concatenated word tokens
+        cur_word_idx += word_len
+
+    return text_ids_with_timestamps
+
+
+def _insert_word_padding(text_ids, pad_id, word_pad_id, word_epad_id):
+    # Find first and last non-zero indices (if any)
+    nz = (text_ids != pad_id).nonzero(as_tuple=False).flatten()
+    
+    if nz.numel() == 0:
+        # No non-zero elements
+        return text_ids
+    
+    if nz.numel() > 0:
+        lo = nz.min()
+        hi = nz.max()
+
+        # Only process between first and last non-zero (inclusive)
+        sub = text_ids[lo:hi+1]
+        mask = sub.eq(0)
+
+        if mask.any():
+            # Set all internal zeros to 1
+            sub[mask] = word_pad_id
+            # Mark last element of each internal zero-run
+            next_mask = torch.cat([mask[1:], torch.zeros(1, dtype=torch.bool, device=mask.device)])
+            ends = mask & ~next_mask
+            sub[ends] = word_epad_id
+    return text_ids
+
+
+def last_nonzero_index(x: torch.Tensor):
+    nz = (x != 0).nonzero(as_tuple=False).flatten()
+    if nz.numel() == 0:
+        return x.shape[0]
+    return nz[-1].item()

@@ -120,33 +120,6 @@ class LhotseTextAdapter:
                 for line in f:
                     yield TextExample(line, language=self.language)
 
-@dataclass
-class LhotseTextJsonlAdapter:
-    """
-    ``LhotseTextJsonlAdapter`` is used to read a JSONL file and wrap
-    the text field of each line into a ``TextExample``.
-    """
-
-    paths: Union[Pathlike, list[Pathlike]]
-    language: str | None = None
-    text_field: str = "text"
-    shuffle_shards: bool = False
-    shard_seed: Union[int, Literal["trng", "randomized"]] = "trng"
-
-    def __post_init__(self):
-        self.paths = expand_sharded_filepaths(self.paths)
-
-    def __iter__(self) -> Iterator[TextExample]:
-        paths = self.paths
-        if self.shuffle_shards:
-            seed = resolve_seed(self.shard_seed)
-            random.Random(seed).shuffle(paths)
-        for path in paths:
-            for data in load_jsonl(path):
-                if self.text_field not in data:
-                    continue
-                yield TextExample(data[self.text_field], language=self.language)
-
 
 @registered_prompt_format_fn(TextExample)
 def default_text_example_prompt_format_fn(example: TextExample, prompt):
@@ -478,6 +451,7 @@ class NeMoMultimodalConversationJsonlAdapter:
     token_equivalent_duration: float = None
     shuffle_shards: bool = False
     shard_seed: Union[int, Literal["trng", "randomized"]] = "trng"
+    slice_length: int | None = None
 
     def __post_init__(self):
         self.manifest_filepath = expand_sharded_filepaths(self.manifest_filepath)
@@ -486,6 +460,7 @@ class NeMoMultimodalConversationJsonlAdapter:
             assert len(self.manifest_filepath) == len(
                 self.tarred_audio_filepaths
             ), f"{len(self.manifest_filepath)} != {len(self.tarred_audio_filepaths)}"
+        self.epoch = 0
 
     def __iter__(self) -> Iterator[NeMoMultimodalConversation]:
         if self.tarred_audio_filepaths is not None:
@@ -493,58 +468,84 @@ class NeMoMultimodalConversationJsonlAdapter:
         else:
             yield from self._iter_jsonl()
 
+    def _get_rng(self) -> random.Random:
+        seed = resolve_seed(self.shard_seed) + self.epoch
+        return random.Random(seed)
+
     def _iter_tar(self):
         paths = list(zip(self.manifest_filepath, self.tarred_audio_filepaths))
+        rng = self._get_rng()
         if self.shuffle_shards:
-            seed = resolve_seed(self.shard_seed)
-            random.Random(seed).shuffle(paths)
+            rng.shuffle(paths)
         for jsonl_path, tar_path in paths:
+            jsonl = load_jsonl(jsonl_path)
+            if self.slice_length is not None:
+                jsonl = list(jsonl)
             tar = iter(TarIterator(tar_path))
-            for data in load_jsonl(jsonl_path):
+            slice_offset = (
+                rng.randint(0, len(jsonl) - self.slice_length)
+                if self.slice_length is not None and self.slice_length < len(jsonl)
+                else -1
+            )
+            cntr = 0
+            for idx, data in enumerate(jsonl):
                 audio_turns = [t for t in data["conversations"] if t["type"] == "audio"]
                 cuts = []
                 for turn in audio_turns:
                     recording, audio_path = next(tar)
                     audio_path = str(audio_path)
                     cut = recording.to_cut()
-                    assert (
-                        audio_path == turn['value']
-                    ), f"Mismatch between JSONL and tar. JSONL defines audio path={turn['value']} but we got the following from tar {audio_path=}"
-                    assert (
-                        cut.duration == turn["duration"]
-                    ), f"Mismatch between JSONL and tar. JSONL defines audio duration={turn['duration']} but we got the following from tar {cut.duration=}"
+                    assert audio_path == turn['value'], (
+                        f"Mismatch between JSONL and tar. JSONL defines audio path={turn['value']} but we got "
+                        f"the following from tar {audio_path=}.\nBad inputs in: {jsonl_path=} {tar_path=}"
+                    )
                     cuts.append(cut)
+                if self._should_skip(data):
+                    continue  # Skip only after tar has been iterated, otherwise there will be data mismatch
+                if idx < slice_offset:
+                    continue
+                elif cntr == self.slice_length:
+                    break
                 cuts = deque(cuts)
+                turns = [
+                    (
+                        TextTurn(
+                            value=turn["value"],
+                            role=turn["from"].lower(),
+                        )
+                        if turn["type"] == "text"
+                        else AudioTurn(
+                            cut=(c := cuts.popleft()),
+                            text=c.supervisions[0].text if c.supervisions else None,
+                            role=turn["from"].lower(),
+                            audio_locator_tag=self.audio_locator_tag,
+                        )
+                    )
+                    for turn in data["conversations"]
+                ]
+                if self.system_prompt is not None and turns[0].role != "system":
+                    turns = [TextTurn(role="system", value=self.system_prompt)] + turns
                 yield NeMoMultimodalConversation(
                     id=data["id"],
-                    turns=[
-                        (
-                            TextTurn(
-                                value=turn["value"],
-                                role=turn[
-                                    "from"
-                                ].lower(),  # prompt formatter role's are typically lowercase: user/assistant
-                            )
-                            if turn["type"] == "text"
-                            else AudioTurn(
-                                cut=cuts.popleft(),
-                                role=turn[
-                                    "from"
-                                ].lower(),  # prompt formatter role's are typically lowercase: user/assistant
-                                audio_locator_tag=self.audio_locator_tag,
-                            )
-                        )
-                        for turn in data["conversations"]
-                    ],
+                    turns=turns,
+                    token_equivalent_duration=self.token_equivalent_duration,
+                    custom=data.get("custom"),
                 )
+                cntr += 1
+
+        self.epoch += 1
 
     def _iter_jsonl(self):
         paths = self.manifest_filepath
+        rng = self._get_rng()
         if self.shuffle_shards:
-            seed = resolve_seed(self.shard_seed)
-            random.Random(seed).shuffle(paths)
+            rng.shuffle(paths)
         for path in paths:
-            for data in load_jsonl(path):
+            jsonl_iter = load_jsonl(path)
+            if self.shuffle_shards:
+                jsonl_iter = list(jsonl_iter)
+                rng.shuffle(jsonl_iter)
+            for data in jsonl_iter:
                 yield NeMoMultimodalConversation(
                     id=data["id"],
                     turns=[

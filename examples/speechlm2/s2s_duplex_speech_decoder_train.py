@@ -37,6 +37,17 @@ def train(cfg):
 
     with trainer.init_module():
         model = DuplexS2SSpeechDecoderModel(OmegaConf.to_container(cfg, resolve=True))
+        
+    use_word_pad = cfg.model.tokenizer.get("use_word_pad", None)
+    use_alignment_items = cfg.data.get("use_alignment_items", None)
+    system_prompt = cfg.model.get("system_prompt", None)
+    use_chat_template = cfg.model.get("use_chat_template", None)
+    user_only = cfg.model.get("user_only", None)
+    delay_user_txt_by = cfg.model.get("delay_user_txt_by", 0)
+    if cfg.model.pretrained_llm.endswith('v2'):
+        model_version = 'v2'
+    else:
+        model_version = 'v1'
 
     dataset = DuplexS2SDataset(
         tokenizer=model.tokenizer,
@@ -44,7 +55,14 @@ def train(cfg):
         source_sample_rate=cfg.data.source_sample_rate,
         target_sample_rate=cfg.data.target_sample_rate,
         input_roles=cfg.data.input_roles,
-        output_roles=cfg.data.output_roles
+        output_roles=cfg.data.output_roles,
+        use_word_pad=use_word_pad,
+        use_alignment_items=use_alignment_items,
+        system_prompt=system_prompt,
+        use_chat_template=use_chat_template,
+        user_only=user_only,
+        delay_user_txt_by=delay_user_txt_by,
+        model_version=model_version
     )
     datamodule = DataModule(cfg.data, tokenizer=model.tokenizer, dataset=dataset)
 

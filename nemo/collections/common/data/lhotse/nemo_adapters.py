@@ -241,6 +241,11 @@ class LazyNeMoTarredIterator:
     Override with an integer value for deterministic behaviour and consult Lhotse documentation for details:
     https://lhotse.readthedocs.io/en/latest/datasets.html#handling-random-seeds
 
+    Set ``slice_length`` to enable random slicing mode: for each shard, we'll randomly select an offset K
+    and skip the first K examples (but will actually read them first). Then, we'll yield only ``slice_length``
+    examples. This setting can improve the sampling randomness when there are many datasets with many shards
+    but only a limited run time.
+
     Example of CutSet with inter-shard shuffling enabled::
 
         >>> cuts = lhotse.CutSet(LazyNeMoTarredIterator(
@@ -276,8 +281,9 @@ class LazyNeMoTarredIterator:
         shard_seed: int | Literal["trng", "randomized"] = "trng",
         text_field: str = "text",
         lang_field: str = "lang",
-        skip_missing_manifest_entries: bool = False,
+        skip_missing_manifest_entries: bool = True,
         extra_fields: list[dict[str, str]] | None = None,
+        slice_length: int = None,
     ) -> None:
         self.skip_missing_manifest_entries = skip_missing_manifest_entries
         self.shard_id_to_manifest: dict[int, Iterable[dict]]
@@ -321,6 +327,8 @@ class LazyNeMoTarredIterator:
         self.text_field = text_field
         self.lang_field = lang_field
         self.extra_fields = extra_fields
+        self.slice_length = slice_length
+        self.epoch = 0
         self._validate()
 
     def to_shards(self) -> List["LazyNeMoTarredIterator"]:
@@ -354,19 +362,42 @@ class LazyNeMoTarredIterator:
         )
         validate_extra_fields(self.extra_fields)
 
+    def _get_seed(self) -> int:
+        return resolve_seed(self.shard_seed) + self.epoch
+        
     @property
     def shard_ids(self) -> List[int]:
         return sorted(self.shard_id_to_manifest.keys())
 
-    def _iter_sequential(self, tar_path, shard_manifest, manifest_path) -> Generator[tuple[dict, bytes], None, None]:
+    def _iter_sequential(
+        self, tar_path, shard_manifest, manifest_path, rng
+    ) -> Generator[tuple[dict, bytes], None, None]:
+        # logging.warning(
+        #     f"Using slice_length: {self.slice_length}",
+        # )
+        slice_offset = (
+            rng.randint(0, len(shard_manifest) - self.slice_length)
+            if self.slice_length is not None and self.slice_length < len(shard_manifest)
+            else -1
+        )
+        cntr = 0
+        self.skip_missing_manifest_entries = True
         with tarfile.open(fileobj=open_best(tar_path, mode="rb"), mode="r|*") as tar:
-            for tar_info in tar:
+            for idx, tar_info in enumerate(tar):
+                if idx < slice_offset:
+                    continue
+                elif cntr == self.slice_length:                   
+                    break
                 try:
                     data = shard_manifest[tar_info.name]
                     raw_audio = tar.extractfile(tar_info).read()
                     yield data, raw_audio, tar_info
+                    cntr += 1
                 except KeyError as e:
                     if self.skip_missing_manifest_entries:
+                        logging.warning(
+                            f"Skipping tar file using missing_manifest_entries: {self.skip_missing_manifest_entries}",
+                        )
                         continue
                     else:
                         raise RuntimeError(
@@ -377,9 +408,10 @@ class LazyNeMoTarredIterator:
     def __iter__(self) -> Generator[Cut, None, None]:
         shard_ids = self.shard_ids
 
-        seed = resolve_seed(self.shard_seed)
+        seed = self._get_seed()
+        rng = random.Random(seed)
         if self.shuffle_shards:
-            random.Random(seed).shuffle(shard_ids)
+            rng.shuffle(shard_ids)
 
         # Propagate the random seed
         extra_fields = [ExtraField.from_dict({"seed": seed, **field_cfg}) for field_cfg in self.extra_fields or ()]
@@ -401,7 +433,7 @@ class LazyNeMoTarredIterator:
             shard_manifest: dict[str, list[dict]] = groupby(basename, self.shard_id_to_manifest[sid])
             tar_path = self.shard_id_to_tar_path[sid]
             try:
-                for data, raw_audio, tar_info in self._iter_sequential(tar_path, shard_manifest, manifest_path):
+                for data, raw_audio, tar_info in self._iter_sequential(tar_path, shard_manifest, manifest_path, rng):
                     meta = soundfile.info(BytesIO(raw_audio))
                     recording = Recording(
                         id=tar_info.path,
@@ -442,6 +474,7 @@ class LazyNeMoTarredIterator:
                 logging.warning(
                     f"Skipping tar file due to read errors (unstable storage or bad file?): {tar_path=}",
                 )
+        self.epoch += 1
 
     def __len__(self) -> int:
         return len(self.source)
