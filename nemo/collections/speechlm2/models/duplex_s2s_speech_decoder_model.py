@@ -784,7 +784,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         if self.ignore_speech_gen or not self.training:
             speaker_encoder_emb = None
         else:  # if training or eval extract embedding from first agent turn returned by the dataloader
-            if self.speech_generation.use_speaker_encoder:
+            if self.cfg.get("speech_decoder", {}).get("_target_", None) == "TransformerARSpeechDecoder" and self.speech_generation.use_speaker_encoder:
                 if 'target_audio' in batch:
                     target_first_turn_audio = batch["target_first_turn_audio"]
                     target_first_turn_audio_lens = batch["target_first_turn_audio_lens"]
@@ -1380,9 +1380,9 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         # Update speaker embedding to reflect the one in the prompt during inference
         if (
             not self.ignore_speech_gen and
+            self.cfg.get("speech_decoder", {}).get("_target_", None) == "TransformerARSpeechDecoder" and
             self.speech_generation.use_speaker_encoder and 
-            self.speech_generation.inference_speaker_reference and
-            self.cfg.get("speech_decoder", {}).get("_target_", None) == "TransformerARSpeechDecoder"
+            self.speech_generation.inference_speaker_reference
         ):
             self.speech_generation.update_inference_speaker_embedding(
                 self.speech_generation.inference_speaker_reference
@@ -1636,7 +1636,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 }
             elif self.cfg.get("speech_decoder", {}).get("_target_", None) == "DuplexEARTTS":
                 # create speaker audio for init
-                speaker_audio, sr = torchaudio.load(self.cfg.inference_speaker_reference)
+                speaker_audio, sr = torchaudio.load(self.cfg.speech_decoder.inference_speaker_reference)
                 speaker_audio = resample(speaker_audio, sr, self.speech_generation.target_sample_rate)
                 speaker_audio = speaker_audio.repeat(B, 1).to(self.device) 
                 # lengths -> [B]
@@ -1992,7 +1992,8 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             self.lm_head = fully_shard(self.lm_head, **fsdp_config)
             self.perception = fully_shard(self.perception, **fsdp_config)
             if not self.ignore_speech_gen:
-                self.speech_generation = fully_shard(self.speech_generation, **fsdp_config)
+                if self.cfg.get("speech_decoder", {}).get("_target_", None) == "TransformerARSpeechDecoder":
+                    self.speech_generation = fully_shard(self.speech_generation, **fsdp_config)
 
     def generate_silence_tokens(self, time_steps: int, num_codebooks: int) -> torch.Tensor:
             """
