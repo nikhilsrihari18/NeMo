@@ -29,6 +29,8 @@ from lhotse.utils import ifnone
 
 from nemo.collections.common.tokenizers import TokenizerSpec
 from nemo.collections.speechlm2.data.utils import get_pad_id, collate_and_pad_1d, collate_and_pad_2d, collate_and_pad
+from nemo.collections.speechlm2.data.force_align import ForceAligner
+# Removed NeMo ASR model imports - now using wav2vec2 directly
 from nemo.utils import logging
 from nemo.collections.common.data.lhotse.text_adapters import Formattable
 
@@ -74,6 +76,10 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         output_roles (list[str], optional):
             List of speaker roles (cut.supervisions[:].speaker) to consider as outputs. Defaults to ["agent"].
 
+        force_align_user_text (bool, optional):
+            If True, performs force alignment on user audio segments to generate word-level timestamps.
+            Only applies to supervision turns where speaker.role is "user". Defaults to False.
+
     Returns:
         A dictionary with the following keys:
             - source_audio: Tensor of source waveform samples [B, T]
@@ -97,6 +103,9 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         - Text tokens from each speaker are placed at frame positions corresponding to their
           timestamp in the original recording, preserving the temporal relationship.
           This is a segment-level alignment only, not word-level alignment.
+        - When force_align_user_text is enabled, user audio segments are
+          force-aligned using wav2vec2 to generate word-level timestamps, which are then
+          converted to frame-level token positions for more precise alignment.
     """
 
     def __init__(
@@ -114,7 +123,9 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         use_chat_template: bool = False,
         user_only: bool = False,
         delay_user_txt_by: int = 0,
-        model_version: str = 'v1'
+        model_version: str = 'v1',
+        force_align_user_text: bool = False,
+        force_align_device: str = None,
     ):
         self.tokenizer = tokenizer
         self.use_word_pad = use_word_pad
@@ -130,6 +141,13 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         self.user_only = user_only        
         self.delay_user_txt_by = delay_user_txt_by
         self.model_version = model_version
+        self.force_align_user_text = force_align_user_text
+        self.force_align_device = force_align_device or ("cuda" if torch.cuda.is_available() else "cpu")
+
+        # Initialize force aligner if needed
+        self.force_aligner = None
+        if self.force_align_user_text:
+            self.force_aligner = ForceAligner(device=self.force_align_device, frame_length=self.frame_length)
 
         assert tokenizer.bos is not None, "BOS support in the tokenizer is required for S2S models."
         assert tokenizer.eos is not None, "EOS support in the tokenizer is required for S2S models."
@@ -203,6 +221,10 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
             source_audio_lens += n_extra_samples
         
         input_roles = None if self.user_only else self.input_roles
+
+        if self.force_align_user_text:
+            self.force_aligner.batch_force_align_user_audio(cuts, source_sample_rate=self.source_sample_rate)
+
         source_tokens, source_token_lens, source_activity = collate_token_channel(
             cuts, self.tokenizer, self.frame_length, roles=input_roles,
             use_alignment_items=self.use_alignment_items,

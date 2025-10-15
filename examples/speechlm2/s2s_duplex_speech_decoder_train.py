@@ -44,6 +44,9 @@ def train(cfg):
     use_chat_template = cfg.model.get("use_chat_template", None)
     user_only = cfg.model.get("user_only", None)
     delay_user_txt_by = cfg.model.get("delay_user_txt_by", 0)
+    force_align_user_text = cfg.model.get("force_align_user_text", False)
+    force_align_device = cfg.model.get("force_align_device", None)
+
     if cfg.model.pretrained_llm.endswith('v2'):
         model_version = 'v2'
     else:
@@ -62,7 +65,9 @@ def train(cfg):
         use_chat_template=use_chat_template,
         user_only=user_only,
         delay_user_txt_by=delay_user_txt_by,
-        model_version=model_version
+        model_version=model_version,
+        force_align_user_text=force_align_user_text,
+        force_align_device=force_align_device,
     )
     datamodule = DataModule(cfg.data, tokenizer=model.tokenizer, dataset=dataset)
 
