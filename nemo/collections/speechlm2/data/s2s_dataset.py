@@ -223,7 +223,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         input_roles = None if self.user_only else self.input_roles
 
         if self.force_align_user_text:
-            self.force_aligner.batch_force_align_user_audio(cuts, source_sample_rate=self.source_sample_rate)
+            self.force_aligner.batch_force_align_user_audio(cuts, roles=input_roles, source_sample_rate=self.source_sample_rate)
 
         source_tokens, source_token_lens, source_activity = collate_token_channel(
             cuts, self.tokenizer, self.frame_length, roles=input_roles,
@@ -785,7 +785,11 @@ def build_token_channel(
                 prefix_ids = [tokenizer.bos]
             else:
                 prefix_ids = chat_start_ids
-            
+
+            # Defensive initialization
+            i_end = None
+            fst_pos = None
+
             if use_alignment_items and supervision.alignment is not None:                
                 for idx, alignment in enumerate(supervision.alignment['word']):
                     if alignment is None:
@@ -798,7 +802,8 @@ def build_token_channel(
                     )                
                     if idx == 0:
                         fst_pos = start_pos + len(prefix_ids) + w_start_pos
-                    if text_overflow:                        
+                    if text_overflow:
+                        logging.warning(f"Text overflow at idx={idx} — stopping alignment early ({diagnostic})")                 
                         break
                     try:
                         i_start = start_pos + w_start_pos + len(prefix_ids)
@@ -810,14 +815,24 @@ def build_token_channel(
                             f"{text_ids.shape=} {diagnostic}"
                         ) from e
 
+                if i_end is None or fst_pos is None:
+                    logging.warning(f"[ALIGN] No valid alignment tokens found — skipping BOS insert ({diagnostic})")
+                    continue
+                
                 lst_pos = i_end + len(prefix_ids)
                 tokens[fst_pos:lst_pos] = _insert_word_padding(
                     tokens[fst_pos:lst_pos],
                     pad_id, word_pad_id, word_epad_id
                 )
-                # Add bos tokens
-                fst_pos -= len(prefix_ids) 
-                tokens[fst_pos:fst_pos+len(prefix_ids)] = torch.as_tensor(prefix_ids, dtype=tokens.dtype, device=tokens.device)
+                # Add bos tokens safely
+                fst_pos -= len(prefix_ids)
+
+                # Safe insertion
+                slice_len = min(len(prefix_ids), tokens.size(0) - fst_pos)
+                if slice_len > 0:
+                    tokens[fst_pos:fst_pos+slice_len] = torch.as_tensor(prefix_ids[:slice_len], dtype=tokens.dtype, device=tokens.device)
+                else:
+                    print(f"Skipping prefix insertion: fst_pos={fst_pos}, prefix_len={len(prefix_ids)}, tokens_len={tokens.size(0)}")
 
                 # Add eos tokens
                 eos_pos = fst_pos + last_nonzero_index(tokens[fst_pos:lst_pos]) + 1 
