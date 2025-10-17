@@ -58,8 +58,8 @@ class ForceAligner:
     
     def batch_force_align_user_audio(self, cuts: CutSet, source_sample_rate: int = 16000) -> None:
         """
-        Perform batch force alignment on all user audio segments.
-        
+        Perform batch force alignment on all user audio segments with debug logging.
+
         Args:
             cuts: CutSet containing all cuts to process
             source_sample_rate: Source sample rate of the audio
@@ -67,35 +67,39 @@ class ForceAligner:
         if self.wav2vec2_model is None:
             logging.warning("Wav2vec2 model not available for force alignment, skipping batch alignment")
             return
-        
+
         user_supervisions = []
         user_cuts = []
-        
+
+        # Collect all user supervisions
         for cut in cuts:
             for supervision in cut.supervisions:
                 if supervision.speaker.lower() == "user":
                     user_supervisions.append(supervision)
                     user_cuts.append(cut)
-        
+
         if not user_supervisions:
             logging.info("No user supervisions found for force alignment")
             return
-        
+
         logging.info(f"Performing force alignment on {len(user_supervisions)} user audio segments")
-        
+
         audio_tensors = []
         texts = []
-        
+
         for i, (supervision, cut) in enumerate(zip(user_supervisions, user_cuts)):
             user_cut = cut.truncate(offset=supervision.start, duration=supervision.duration)
             audio = user_cut.load_audio()
-            
+
+            # Convert multi-channel audio to mono
             if audio.shape[0] > 1:
                 audio = audio.mean(dim=0, keepdim=True)
-            
+
+            # Ensure tensor type
             if isinstance(audio, np.ndarray):
                 audio = torch.from_numpy(audio)
-            
+
+            # Resample if needed
             target_sample_rate = 16000
             if source_sample_rate != target_sample_rate:
                 resampler = torchaudio.transforms.Resample(
@@ -103,17 +107,36 @@ class ForceAligner:
                     new_freq=target_sample_rate
                 )
                 audio = resampler(audio)
-            
+
             audio_tensors.append(audio)
             texts.append(self._strip_timestamps(supervision.text))
-        
+
+            # Debug log a few samples
+            if i < 3:
+                logging.info(f"[DEBUG] Original text ({i}): {supervision.text}")
+                logging.info(f"[DEBUG] Audio shape: {audio.shape}, duration: {supervision.duration:.2f}s")
+
+        # Run batch alignment
         alignments_batch = self._wav2vec2_batch_align_tensors(audio_tensors, texts)
-        
+
         for i, alignment_result in enumerate(alignments_batch):
-            if alignment_result is not None:
-                original_text = user_supervisions[i].text
-                timestamped_text = self._convert_wav2vec2_alignment_to_timestamped_text(alignment_result, original_text)
-                user_supervisions[i].text = timestamped_text
+            if alignment_result is None:
+                logging.warning(f"No alignment result for supervision {i} - text: {user_supervisions[i].text}")
+                continue
+
+            original_text = user_supervisions[i].text
+            timestamped_text = self._convert_wav2vec2_alignment_to_timestamped_text(alignment_result, original_text)
+            logging.info(f"[DEBUG] Aligned text ({i}): {timestamped_text}")
+
+            # Show word-level timestamps for first 3 supervisions
+            if i < 3:
+                logging.info(f"[DEBUG] Word-level timestamps for supervision {i}:")
+                for word_info in alignment_result:  # <- iterate directly over list
+                    if word_info is not None:
+                        logging.info(f"  {word_info['word']} {word_info['start']:.3f}s - {word_info['end']:.3f}s")
+
+            # Update supervision text with alignment
+            user_supervisions[i].text = timestamped_text
     
     def _wav2vec2_batch_align_tensors(self, audio_tensors: List[torch.Tensor], texts: List[str]) -> List[Optional[List[Dict[str, Any]]]]:
         """
