@@ -32,6 +32,8 @@ from nemo.collections.speechlm2.data.utils import get_pad_id, collate_and_pad_1d
 from nemo.utils import logging
 from nemo.collections.common.data.lhotse.text_adapters import Formattable
 
+from typing import Tuple
+
 MIN_FRAMES_FOR_TEXT = 3
 
 
@@ -691,7 +693,7 @@ def build_aligned_tokens(
     text_ids = torch.as_tensor(tokenizer.text_to_ids(" " + alignment.symbol))
     
     start_pos = compute_num_frames(alignment.start, frame_length, sampling_rate)
-    if superv_start_pos + start_pos >= tokens_len:
+    if superv_start_pos + start_pos >= tokens_len + 3:  # +3 to avoid verbose warnings
         logging.warning(
             f"Ill-constructed example: the beginning offset of a word {superv_start_pos + start_pos} is larger " \
             f"than or equal to the example's length {tokens_len}. {diagnostic}\n"
@@ -753,34 +755,41 @@ def build_token_channel(
     
     agent_bos_id = get_chat_start_ids(tokenizer, True, version=model_version)
     user_bos_id = get_chat_start_ids(tokenizer, False, version=model_version)
-
+    bos_ids = None  
+    # turn_idx = -1
     for supervision in cut.supervisions:
         if roles is None or supervision.speaker in roles:
 
             start_pos = compute_num_frames(supervision.start, frame_length, cut.sampling_rate) + delay_user_txt_by
             
             if chat_start_ids is None:
-                prefix_ids = [tokenizer.bos]
+                bos_ids = [tokenizer.bos]
             else:
-                prefix_ids = chat_start_ids
+                bos_ids = chat_start_ids
             
-            if use_alignment_items and supervision.alignment is not None:                
+            # Init values
+            fst_pos = start_pos + len(bos_ids)
+            i_start = fst_pos
+            i_end = i_start + 1
+            
+            if use_alignment_items and supervision.alignment is not None and len(supervision.alignment['word']) > 0:                
+                prev_end_pos = 0
                 for idx, alignment in enumerate(supervision.alignment['word']):
                     if alignment is None:
                         logging.warning(f"Empty alignment found at index {idx} - info: {diagnostic}\n")
                         continue
                     
                     text_ids, w_start_pos, w_end_pos, w_eos_pos, text_overflow = build_aligned_tokens( # type: ignore
-                        alignment, idx, start_pos, tokenizer, frame_length, cut.sampling_rate, len(tokens)-len(prefix_ids),
+                        alignment, idx, start_pos, tokenizer, frame_length, cut.sampling_rate, len(tokens)-len(bos_ids),
                         diagnostic 
                     )                
                     if idx == 0:
-                        fst_pos = start_pos + len(prefix_ids) + w_start_pos
+                        fst_pos = start_pos + len(bos_ids) + w_start_pos
                     if text_overflow:                        
                         break
                     try:
-                        i_start = start_pos + w_start_pos + len(prefix_ids)
-                        i_end = start_pos + w_end_pos + len(prefix_ids)
+                        i_start = start_pos + w_start_pos + len(bos_ids)
+                        i_end = start_pos + w_end_pos + len(bos_ids)
                         tokens[i_start:i_end] = text_ids
                     except Exception as e:
                         raise RuntimeError(
@@ -788,14 +797,14 @@ def build_token_channel(
                             f"{text_ids.shape=} {diagnostic}"
                         ) from e
 
-                lst_pos = i_end + len(prefix_ids)
+                lst_pos = i_end  #  + len(bos_ids)  # !!! CHECK THIS !!!
                 tokens[fst_pos:lst_pos] = _insert_word_padding(
                     tokens[fst_pos:lst_pos],
                     pad_id, word_pad_id, word_epad_id
                 )
                 # Add bos tokens
-                fst_pos -= len(prefix_ids) 
-                tokens[fst_pos:fst_pos+len(prefix_ids)] = torch.as_tensor(prefix_ids, dtype=tokens.dtype, device=tokens.device)
+                fst_pos -= len(bos_ids) 
+                tokens[fst_pos:fst_pos+len(bos_ids)] = torch.as_tensor(bos_ids, dtype=tokens.dtype, device=tokens.device)
 
                 # Add eos tokens
                 eos_pos = fst_pos + last_nonzero_index(tokens[fst_pos:lst_pos]) + 1 
@@ -819,7 +828,7 @@ def build_token_channel(
                 available_frames_for_text = eos_pos - start_pos
                 
                 if data_format == 'shars':
-                    text_ids = torch.as_tensor(prefix_ids + tokenizer.text_to_ids(supervision.text)) # type: ignore
+                    text_ids = torch.as_tensor(bos_ids + tokenizer.text_to_ids(supervision.text)) # type: ignore
                 else:  # ASR tars  TODO: extract timestamps into alignmentItems and use code above to avoid two different versions
                     if len(supervision.text) == 0:  
                         continue
@@ -837,7 +846,7 @@ def build_token_channel(
                     )
                     text_ids = _insert_word_padding(text_ids, pad_id, word_pad_id, word_epad_id)
                     
-                    text_ids = torch.cat([torch.as_tensor(prefix_ids), text_ids])
+                    text_ids = torch.cat([torch.as_tensor(bos_ids), text_ids])
                 
                 if available_frames_for_text > 0 and len(text_ids) > available_frames_for_text:
                     # Truncate text_ids to fit before the eos position.
@@ -872,7 +881,11 @@ def build_token_channel(
                 else:  # more text than expected, we should still force an eos
                     tokens[-1] = tokenizer.eos
                     activity_mask[-1] = tokenizer.eos
-
+                    # Avoid eos and bos in the middle of long utterances
+    
+    if bos_ids is not None:  # Ensure we went through some supervisions above
+        tokens = _correct_ebos(tokens, tokenizer.eos, bos_ids, pad_id, word_pad_id, word_epad_id, diagnostic)
+    
     return tokens, activity_mask
 
 
@@ -1080,3 +1093,37 @@ def last_nonzero_index(x: torch.Tensor):
     if nz.numel() == 0:
         return x.shape[0]
     return nz[-1].item()
+
+
+def _correct_ebos(text_ids, eos_id, role_bos_ids, pad_id, word_pad_id, word_epad_id, diagnostic):
+    """Avoid eos or bos in the middle of a same long utterance"""
+    bos_condition = (text_ids == role_bos_ids[0])
+    if len(role_bos_ids) > 1:  
+        # Assuming the first two tokens role_bos_ids are enough
+        bos_condition = bos_condition[:-1] & (text_ids[1:] == role_bos_ids[1])  
+    bos_idx = (bos_condition).nonzero(as_tuple=False).flatten()
+    for idx in bos_idx:
+        if idx < 2:
+            continue
+        if text_ids[idx-1] != pad_id:
+            if text_ids[idx-1] == word_pad_id:
+                text_ids[idx] = word_epad_id
+            elif text_ids[idx-1] == word_epad_id:
+                text_ids[idx] = word_epad_id
+                text_ids[idx-1] = word_pad_id
+            else:
+                if idx+1 < text_ids.shape[0] and text_ids[idx+1] == word_pad_id:
+                    text_ids[idx] = word_pad_id
+                else:
+                    text_ids[idx] = word_epad_id
+    
+    eos_idx = (text_ids == eos_id).nonzero(as_tuple=False).flatten()
+    for idx in eos_idx:
+        if idx > text_ids.shape[0]-2:
+            continue
+        if text_ids[idx+1] != pad_id:
+            # if text_ids[idx+1] == word_pad_id or text_ids[idx+1] == word_epad_id:
+            #     text_ids[idx] = word_pad_id
+            # else:
+            text_ids[idx] = word_pad_id
+    return text_ids
