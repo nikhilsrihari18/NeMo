@@ -12,19 +12,53 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
-
+from pathlib import Path
 import torch
 from lightning.pytorch import Trainer
 from omegaconf import OmegaConf
+
+import torch.distributed.checkpoint as dcp
+from torch.distributed.checkpoint import load_state_dict
+from collections import OrderedDict
 
 from nemo.collections.speechlm2 import DataModule, DuplexS2SDataset, DuplexS2SSpeechDecoderModel
 from nemo.core.config import hydra_runner
 from nemo.utils.exp_manager import exp_manager
 from nemo.utils.trainer_utils import resolve_trainer_cfg
+from nemo.utils import logging
+
 
 torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
 
+def dcp_dir_to_state_dict(meta, top_key, reader):
+    state_map = {}
+    for ky in meta.state_dict_metadata:
+        if not ky.startswith(top_key):
+            continue
+        state_map[ky] = torch.zeros(
+            meta.state_dict_metadata[ky].size,
+            dtype=meta.state_dict_metadata[ky].properties.dtype
+        ) 
 
+    dcp.load_state_dict(state_map, storage_reader=reader, no_dist=True)
+    # Return plain CPU dict suitable for model.load_state_dict(...)
+    return {k.replace('state_dict.', ''): v.detach().cpu().clone() for k, v in state_map.items()}
+
+
+def init_from_model_from_train_ckpt(ckpt_path, model, selected_modules=None): 
+    
+    logging.info("Restoring training ckpt from %s..." % ckpt_path)   
+
+    state_map = {}
+    reader = dcp.FileSystemReader(ckpt_path)
+    meta = reader.read_metadata()
+    for module in selected_modules:
+        state_map.update(
+            dcp_dir_to_state_dict(meta, f"state_dict.{module}", reader)
+        )
+    model.load_state_dict(state_map, strict=True)
+
+    return model
 @hydra_runner(config_path="conf", config_name="s2s_duplex_speech_decoder")
 def train(cfg):
     OmegaConf.resolve(cfg)
@@ -32,12 +66,22 @@ def train(cfg):
     torch.set_float32_matmul_precision("medium")
     torch.backends.cudnn.allow_tf32 = True
     trainer = Trainer(**resolve_trainer_cfg(cfg.trainer))
-    log_dir = exp_manager(trainer, cfg.get("exp_manager", None))
+    log_dir = exp_manager(trainer, cfg.get("exp_manager", ""))
     OmegaConf.save(cfg, log_dir / "exp_config.yaml")
 
     with trainer.init_module():
         model = DuplexS2SSpeechDecoderModel(OmegaConf.to_container(cfg, resolve=True))
         
+        if cfg.model.get("pretrained_s2s_train_ckpt", None):
+            if (Path(cfg.exp_manager.explicit_log_dir) / 'checkpoints').exists():
+                logging.info("Intermediate checkpoints found in exp dir. We won't restore training ckpt from pretrained_s2s_train_ckpt...") 
+            else:
+                model = init_from_model_from_train_ckpt(
+                    cfg.model.pretrained_s2s_train_ckpt, 
+                    model,
+                    selected_modules=cfg.model.get("selected_init_modules", None)
+                )
+
     use_word_pad = cfg.model.tokenizer.get("use_word_pad", None)
     use_alignment_items = cfg.data.get("use_alignment_items", None)
     system_prompt = cfg.model.get("system_prompt", None)
@@ -45,7 +89,7 @@ def train(cfg):
     user_only = cfg.model.get("user_only", None)
     delay_user_txt_by = cfg.model.get("delay_user_txt_by", 0)
     if cfg.model.pretrained_llm.endswith('v2'):
-        model_version = 'v2'
+        model_version = 'v2-short'
     else:
         model_version = 'v1'
 
