@@ -127,7 +127,8 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         delay_user_txt_by: int = 0,
         model_version: str = 'v1',
         force_align_user_text: bool = False,
-        force_align_device: str = None,
+        force_align_agent_text: bool = False,
+        force_align_device: str | None = None,
     ):
         self.tokenizer = tokenizer
         self.use_word_pad = use_word_pad
@@ -144,11 +145,12 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         self.delay_user_txt_by = delay_user_txt_by
         self.model_version = model_version
         self.force_align_user_text = force_align_user_text
+        self.force_align_agent_text = force_align_agent_text
         self.force_align_device = force_align_device or ("cuda" if torch.cuda.is_available() else "cpu")
 
         # Initialize force aligner if needed
         self.force_aligner = None
-        if self.force_align_user_text:
+        if self.force_align_user_text or self.force_align_agent_text:
             self.force_aligner = ForceAligner(device=self.force_align_device, frame_length=self.frame_length)
 
         assert tokenizer.bos is not None, "BOS support in the tokenizer is required for S2S models."
@@ -225,7 +227,10 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         input_roles = None if self.user_only else self.input_roles
 
         if self.force_align_user_text:
-            self.force_aligner.batch_force_align_user_audio(cuts, roles=input_roles, source_sample_rate=self.source_sample_rate)
+            self.force_aligner.batch_force_align_user_audio(
+                cuts, roles=input_roles, source_sample_rate=self.source_sample_rate
+            )
+            data_format = 'forced_align'
 
         source_tokens, source_token_lens, source_activity = collate_token_channel(
             cuts, self.tokenizer, self.frame_length, roles=input_roles,
@@ -238,6 +243,12 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
             delay_user_txt_by=self.delay_user_txt_by
         )
         if not self.user_only:
+            if self.force_align_agent_text:
+                self.force_aligner.batch_force_align_user_audio(  # TODO: rename this so it's role generic
+                    cuts, roles=self.output_roles, source_sample_rate=self.source_sample_rate
+                )
+                data_format = 'forced_align'
+            
             target_tokens, target_token_lens, target_activity = collate_token_channel(
                 cuts, self.tokenizer, self.frame_length, roles=self.output_roles,
                 use_alignment_items=self.use_alignment_items,
@@ -794,7 +805,11 @@ def build_token_channel(
             i_start = fst_pos
             i_end = i_start + 1
             
-            if use_alignment_items and supervision.alignment is not None and len(supervision.alignment['word']) > 0:                
+            if (
+                data_format == 'shars' and use_alignment_items and 
+                supervision.alignment is not None and len(supervision.alignment['word']) > 0
+            ):                
+                prev_end_pos = 0
                 for idx, alignment in enumerate(supervision.alignment['word']):
                     if alignment is None:
                         logging.warning(f"Empty alignment found at index {idx} - info: {diagnostic}\n")
@@ -858,7 +873,7 @@ def build_token_channel(
                 
                 if data_format == 'shars':
                     text_ids = torch.as_tensor(bos_ids + tokenizer.text_to_ids(supervision.text)) # type: ignore
-                else:  # ASR tars  TODO: extract timestamps into alignmentItems and use code above to avoid two different versions
+                else:  # ASR tars or forced alignment   TODO: extract timestamps into alignmentItems and use code above to avoid two different versions
                     if len(supervision.text) == 0:  
                         continue
                                         

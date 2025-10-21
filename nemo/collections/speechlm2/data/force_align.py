@@ -74,7 +74,7 @@ class ForceAligner:
         # Collect all user supervisions
         for cut in cuts:
             for supervision in cut.supervisions:
-                if supervision.speaker in roles:
+                if roles is None or supervision.speaker in roles:
                     user_supervisions.append(supervision)
                     user_cuts.append(cut)
         
@@ -82,7 +82,7 @@ class ForceAligner:
             logging.info("No user supervisions found for force alignment")
             return
 
-        logging.info(f"[DEBUG] Performing force alignment on {len(user_supervisions)} user audio segments")
+        # logging.info(f"[DEBUG] Performing force alignment on {len(user_supervisions)} user audio segments")
 
         audio_tensors = []
         texts = []
@@ -99,7 +99,7 @@ class ForceAligner:
             if isinstance(audio, np.ndarray):
                 audio = torch.from_numpy(audio)
 
-            # Resample if needed
+            # Resample if needed  TODO: read target sample rate from config
             target_sample_rate = 16000
             if source_sample_rate != target_sample_rate:
                 resampler = torchaudio.transforms.Resample(
@@ -112,9 +112,9 @@ class ForceAligner:
             texts.append(self._strip_timestamps(supervision.text))
 
             # Debug log a few samples
-            if i < 3:
-                logging.info(f"[DEBUG] Original text ({i}): {supervision.text}")
-                logging.info(f"[DEBUG] Audio shape: {audio.shape}, duration: {supervision.duration:.2f}s")
+            # if i < 3:
+            #     logging.info(f"[DEBUG] Original text ({i}): {supervision.text}")
+            #     logging.info(f"[DEBUG] Audio shape: {audio.shape}, duration: {supervision.duration:.2f}s")
 
         # Run batch alignment
         alignments_batch = self._wav2vec2_batch_align_tensors(audio_tensors, texts)
@@ -123,14 +123,14 @@ class ForceAligner:
             if alignment_result is not None:
                 original_text = user_supervisions[i].text
                 timestamped_text = self._convert_wav2vec2_alignment_to_timestamped_text(alignment_result, original_text)
-                logging.info(f"[DEBUG] Aligned text ({i}): {timestamped_text}")
+                # logging.info(f"[DEBUG] Aligned text ({i}): {timestamped_text}")
 
                 # Show word-level timestamps for first 3 supervisions
-                if i < 3:
-                    logging.info(f"[DEBUG] Word-level timestamps for supervision {i}:")
-                    for word_info in alignment_result:  # <- iterate directly over list
-                        if word_info is not None:
-                            logging.info(f"  {word_info['word']} {word_info['start']:.3f}s - {word_info['end']:.3f}s")
+                # if i < 3:
+                #     logging.info(f"[DEBUG] Word-level timestamps for supervision {i}:")
+                #     for word_info in alignment_result:  # <- iterate directly over list
+                #         if word_info is not None:
+                #             logging.info(f"  {word_info['word']} {word_info['start']:.3f}s - {word_info['end']:.3f}s")
 
                 # Update supervision text with alignment
                 user_supervisions[i].text = timestamped_text

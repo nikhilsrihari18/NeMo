@@ -89,6 +89,7 @@ def train(cfg):
     user_only = cfg.model.get("user_only", None)
     delay_user_txt_by = cfg.model.get("delay_user_txt_by", 0)
     force_align_user_text = cfg.model.get("force_align_user_text", False)
+    force_align_agent_text = cfg.data.get("force_align_agent_text", False)
     force_align_device = cfg.model.get("force_align_device", None)
 
     if cfg.model.pretrained_llm.endswith('v2'):
@@ -111,6 +112,7 @@ def train(cfg):
         delay_user_txt_by=delay_user_txt_by,
         model_version=model_version,
         force_align_user_text=force_align_user_text,
+        force_align_agent_text=force_align_agent_text,
         force_align_device=force_align_device,
     )
     datamodule = DataModule(cfg.data, tokenizer=model.tokenizer, dataset=dataset)
