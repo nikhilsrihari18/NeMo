@@ -108,8 +108,16 @@ def delay_eos(tokens, eos_token_id, pad_token_id, shift=10):
     return tokens
 
 
-def tokens_to_text(batch_ids, tokenizer):
+def tokens_to_text(batch_ids, tokenizer, text_only=False):
     texts = []
+    disp_norm = {
+        "<SPECIAL_990>": "|990|",
+        "<SPECIAL_980>": "|980|",
+        "<SPECIAL_985>": "_",
+        "<SPECIAL_986>": "*",
+        "<SPECIAL_12>": "|12|",
+        "<unk>": "-"
+    }
     for idx in range(batch_ids.shape[0]):
         ids = batch_ids[idx]
         # Convert tensor/np array to a Python list
@@ -122,9 +130,93 @@ def tokens_to_text(batch_ids, tokenizer):
         ids = [i for i in ids if i != -100]
 
         # Decode to string
-        texts.append(tokenizer.decode(ids, skip_special_tokens=True, clean_up_tokenization_spaces=True))
-
+        decod = tokenizer.decode(
+            ids, skip_special_tokens=text_only,
+            clean_up_tokenization_spaces=text_only
+        )
+        for ky in disp_norm:
+            decod = decod.replace(ky, disp_norm[ky])
+        texts.append(decod)
     return texts
+
+
+def setup_special_token_embeddings(llm, tokenizer, special_token_ids, model_name='base_model', embeddings_name='embeddings'):
+    model = getattr(llm, model_name)
+    
+    embeddings = getattr(model, embeddings_name)
+    embeddings.weight.requires_grad = True
+
+    # IDs for the special tokens (robust even if vocab grew from other sources)
+    special_token_ids = torch.tensor(sorted(set(int(i) for i in special_token_ids)), dtype=torch.long)
+
+    # Build the complement set (rows to freeze)
+    freeze_ids = torch.tensor(
+        [i for i in range(embeddings.num_embeddings) if i not in set(special_token_ids.tolist())],
+        dtype=torch.long
+    )            
+    # Register a hook that zeroes the gradient on all "freeze_ids"
+    def mask_old_rows(grad: torch.Tensor):
+        # grad shape == (vocab_size, hidden_size)
+        if grad is None:
+            return grad
+        if freeze_ids.numel() > 0:
+            grad.index_fill_(0, freeze_ids.to(grad.device), 0)
+        return grad
+
+    _ = embeddings.weight.register_hook(mask_old_rows)
+    
+    # If model has untied output embeddings, also mask the LM head
+    if llm.lm_head is embeddings:  # tied
+        print("!!! lm_head and embeddings are tied !!!")
+        # If it's a Linear with shape (vocab, hidden), we mask rows by zeroing grad rows
+        # if hasattr(llm.lm_head, "weight") and llm.lm_head.weight.shape[0] == embeddings.num_embeddings:
+        #     llm.lm_head.weight.requires_grad = True
+        #     def mask_old_rows_lm_head(grad: torch.Tensor):
+        #         if grad is None:
+        #             return grad
+        #         if freeze_ids.numel() > 0:
+        #             grad.index_fill_(0, freeze_ids.to(grad.device), 0)
+        #         return grad
+        #     _ = llm.lm_head.weight.register_hook(mask_old_rows_lm_head)
+            
+
+
+# TODO: move to parts
+class FiLMConditioner(nn.Module):
+    """
+    z = g(h)  : conditioning variable
+    y = gamma(z) ⊙ f(x) + beta(z) : conditioned output
+
+    """
+    def __init__(self, in_dim, out_dim, z_dim=1, activation=nn.ReLU()):
+        super().__init__()
+        self.linear = nn.Sequential(
+            nn.Linear(in_dim, z_dim),
+            #nn.Sigmoid()
+            activation
+        )
+        self.cond = nn.Linear(z_dim, 2 * out_dim)
+
+        # Start near identity modulation: gamma≈1, beta≈0
+        with torch.no_grad():
+            self.cond.weight.zero_()
+            self.cond.bias[:in_dim].fill_(1.0)   # gamma
+            self.cond.bias[in_dim:].zero_()      # beta
+
+    def forward(self, x, h):
+        z = self.linear(h)
+        if z.dim() == 1:
+            z = z.unsqueeze(-1)
+        z = z.clamp(0.0, 1.0)
+
+        gb = self.cond(z)                        # [B, 2*out_dim]
+        gamma, beta = gb.split(x.size(-1), dim=-1)
+
+        assert_finite("gamma", gamma)
+        assert_finite("beta", beta)
+
+        return gamma * x + beta
+
 
 
 class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
@@ -138,10 +230,12 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         # convert dict to config
         cfg = DictConfig(cfg)
         self.cfg = cfg.model
+        self.exp_manager = cfg.exp_manager
         self.target_sample_rate = cfg.data.target_sample_rate
         self.source_sample_rate = cfg.data.source_sample_rate
         self.validation_save_path = os.path.join(cfg.exp_manager.explicit_log_dir, "validation_logs")
-
+        if self.cfg.get("force_user_text", None):
+            print("\n\nFORCING USER TEXT..............\n\n")
         # move back text channel by x, in inference it advance the text channel prediction by x frames
         self.advance_text_channel_by = self.cfg.get("advance_text_channel_by", None)
 
@@ -190,17 +284,49 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 self.tokenizer.pad_token = '<|extra_1|>'
                 
         if self.cfg.pretrained_llm.endswith('v2'):
-            self.model_version = 'v2'
+            self.model_version = 'v2-short'
         else:
             self.model_version = 'v1'
 
         llm = load_pretrained_hf(self.cfg.pretrained_llm, pretrained_weights=self.cfg.pretrained_weights).train()
+        
+        # Prepare to learn new embeddings for selected special tokens
+        if self.cfg.get("tokenizer", None) and self.cfg.tokenizer.get("train_new_embeddings", None):
+            special_token_ids = self.user_start_ids
+            if not self.cfg.tokenizer.get("freeze_agent_specials", None):
+                special_token_ids += self.assistant_start_ids
+            if self.use_word_pad:
+                special_token_ids = special_token_ids + self.word_pad_id + self.word_epad_id
+            
+            setup_special_token_embeddings(llm, self.tokenizer, special_token_ids)
+                
         self.llm = getattr(llm, self.cfg.get("llm", {}).get("base_model_name", "model"))
         self.lm_head = llm.lm_head
         # Note: we have to "move out" the token embedding outside of LLM to avoid
         #       messing up FSDP/TP hooks.
         self.embed_tokens = getattr(self.llm, self.cfg.get("llm", {}).get("embeddings_name", "embed_tokens"))
         delattr(self.llm, self.cfg.get("llm", {}).get("embeddings_name", "embed_tokens"))
+
+        if self.cfg.get("do_user_asr", None) and self.cfg.get("use_film_cond", None):
+
+            if self.cfg.get("film_conditioner", "perception_emb") == 'perception_emb':
+                hidden_size = llm.config.hidden_size
+            else: # asr_emb
+                hidden_size = self.cfg['perception']['modality_adapter']['d_model']
+
+
+            self.agent_film = FiLMConditioner(
+                hidden_size,
+                hidden_size,
+                # llm.config.vocab_size,
+                z_dim = 128  # TODO: add to config and test larger values
+                # z_dim = 512
+            )
+
+            
+        # Add word padding tokens and prepare to learn new embeddings just for them: TODO: DEL NOT NEEDED ANYMORE, USING EXISTING SPECIAL TOKENS
+        # if self.cfg.get("tokenizer.use_word_pad", None):
+        #     add_word_pad_token_embeddings(self, cfg.get("tokenizer.train_new_embed_only", None))
 
         maybe_install_lora(self)
 
@@ -488,13 +614,26 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             kwargs[cache_key] = cache
         else:
             kwargs['use_cache'] = False
-        out = self.llm(**kwargs)
         
+        out = self.llm(**kwargs)        
         B, T = input_embeds.shape[:2]
         
-        text_logits = self.lm_head(out['last_hidden_state'])  # (B, T, text_vocab_size)
-        if self.cfg.get("do_user_asr", None):
-            user_text_logits = text_logits
+        if self.cfg.get("do_user_asr", None) and self.cfg.get("use_film_cond", None):
+            if self.cfg.get("film_conditioner", 'perception_emb') == 'asr_emb':
+                cond_embed = asr_emb
+            else:
+                cond_embed = modality_adapter_emb
+
+            x = out['last_hidden_state']
+            agent_gated_hidden = self.agent_film(x, cond_embed)
+            text_logits = self.lm_head(agent_gated_hidden)  # (B, T, text_vocab_size)
+            
+            user_text_logits = self.lm_head(x)  # (B, T, text_vocab_size)
+
+        else:
+            text_logits = self.lm_head(out['last_hidden_state'])  # (B, T, text_vocab_size)
+            if self.cfg.get("do_user_asr", None):
+                user_text_logits = text_logits     
 
         if seq_mask is not None:
             # This is training Mode
@@ -934,7 +1073,41 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
 
 
         # Sum agent and user embeddings
-        input_embeds.add_(source_encoded[:, :-1] * self.cfg.get("duplex_user_channel_weight", 1.0))
+        if self.cfg.get("skip_agent_pad_input", None):
+            agent_padding_pos = text_inputs.eq(self.text_pad_id)
+            if True:
+                agent_padding_pos = (
+                    agent_padding_pos |    
+                    text_inputs.eq(self.word_pad_id[0]) | 
+                    text_inputs.eq(self.word_epad_id[0]) 
+                ) 
+            
+            user_padding_pos = source_tokens.eq(self.text_pad_id)
+            if True:
+                user_padding_pos = (
+                    user_padding_pos |    
+                    source_tokens.eq(self.word_pad_id[0]) | 
+                    source_tokens.eq(self.word_epad_id[0]) 
+                )
+
+            # Set agent padding token embeddings to 0
+            padding_pos = agent_padding_pos   # & ~user_padding_pos : do it just once (for user below) you end up summing            
+            input_embeds = input_embeds.masked_fill(padding_pos.unsqueeze(-1), 0.0)
+
+            if self.cfg.get("force_user_text", None): # Force user's text
+                source_embeds = self.embed_tokens(source_tokens)
+            else:  # Use user's audio input
+                source_embeds = source_encoded[:, :-1]
+            
+            if self.cfg.get("skip_user_pad_input", None):
+                # Set user padding token embeddings to 0, can only be done for "forced" training with source text GT
+                padding_pos = ~agent_padding_pos & user_padding_pos
+                source_embeds = source_embeds.masked_fill(padding_pos.unsqueeze(-1), 0.0)
+
+            # Safely add source and agent without 'interfering' padding token embeddings (when no speech overlap)
+            input_embeds.add_(source_embeds)
+        else:
+            input_embeds.add_(source_encoded[:, :-1] * self.cfg.get("duplex_user_channel_weight", 1.0))
 
         # create sequence mask
         if not ignore_speech_gen and 'target_audio' in batch:
@@ -1141,6 +1314,10 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             self.perception.preprocessor, self.perception.encoder,
             self.llm, self.lm_head, self.embed_tokens
         ):
+            if self.cfg.get(
+                "tokenizer", None
+                ) and self.cfg.tokenizer.get("train_new_embeddings", None) and m is self.embed_tokens:
+                continue
             if is_frozen(m):
                 m.eval()
         if not ignore_speech_gen and is_frozen(self.speech_generation):
@@ -1220,11 +1397,11 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                     if num_agent_frames != 0:
                         # TODO: move all this to a function
                         agent_text_labels = inputs["text_labels"].unsqueeze(-1)
-                        agent_text_labels = torch.where(
-                            inputs["target_activity"] != 0,
-                            agent_text_labels,
-                            torch.ones_like(agent_text_labels, dtype=torch.long) * (-100)
-                        )
+                        # agent_text_labels = torch.where(
+                        #     inputs["target_activity"] != 0,
+                        #     agent_text_labels,
+                        #     torch.ones_like(agent_text_labels, dtype=torch.long) * (-100)
+                        # )
                         agent_eos_mask = agent_text_labels == self.text_eos_id
                         # TODO: generalize the following by getting the output from the data loader
                         if len(self.assistant_start_ids) > 1:
@@ -1263,11 +1440,11 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                     user_text_logits = forward_outputs["user_text_logits"]
   
                     user_text_labels = inputs["user_text_labels"].unsqueeze(-1)
-                    user_text_labels = torch.where(
-                        inputs["source_activity"] != 0,
-                        user_text_labels,
-                        torch.ones_like(user_text_labels, dtype=torch.long) * (-100)
-                    )
+                    # user_text_labels = torch.where(
+                    #     inputs["source_activity"] != 0,
+                    #     user_text_labels,
+                    #     torch.ones_like(user_text_labels, dtype=torch.long) * (-100)
+                    # )
                     user_eos_mask = user_text_labels == self.text_eos_id
                     if len(self.user_start_ids) > 1:
                         # TODO: generalize the following by getting the output from the data loader
@@ -1383,21 +1560,48 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 ans['audio_loss'] = audio_loss
             self.log_dict(ans, on_step=True)
 
-            if self.cfg.get("log_train_metrics", None):
+            if self.cfg.get("log_train_metrics", None):  # Note: all these are optimistic because of teacher forcing
                 tok = self.tokenizer.tokenizer
+                user_ref_tokens = inputs["user_text_labels"]
                 if self.cfg.get("do_user_asr", None):
                     user_pred_tokens = user_text_logits.argmax(dim=-1)
-
-                    user_ref_text = tokens_to_text(inputs["user_text_labels"], tok)
-                    user_pred_text = tokens_to_text(user_pred_tokens, tok)
+                    if not self.cfg.get("use_film_cond", None):
+                        # Mask tokens where user is inactive. This results in an optimistic view of things
+                        user_pred_tokens = torch.where(
+                            inputs["source_activity"].squeeze(-1) != 0,
+                            user_pred_tokens,
+                            torch.ones_like(user_pred_tokens, dtype=torch.long) * (-100)
+                        )  # -100 will be skipped by tokens_to_text()
+                        user_ref_tokens = torch.where(
+                            inputs["source_activity"].squeeze(-1) != 0,
+                            user_ref_tokens,
+                            torch.ones_like(user_ref_tokens, dtype=torch.long) * (-100)
+                        )  # -100 will be skipped by tokens_to_text()
+                                                
+                    # Get a very rough WER metric dropping all special tokens and spaces
+                    user_ref_text = tokens_to_text(user_ref_tokens, tok, text_only=True)
+                    user_pred_text = tokens_to_text(user_pred_tokens, tok,  text_only=True)
                     wer = word_error_rate(hypotheses=user_pred_text, references=user_ref_text)
                     self.log("user_wer", wer, on_step=True, prog_bar=True, logger=True)
 
-                is_last_batch = batch_idx == (self.trainer.num_training_batches - 1)
-                if is_last_batch:
+                is_last_batches = batch_idx >= (self.trainer.num_training_batches - 10)
+                if is_last_batches:
                     pred_tokens = text_logits.argmax(dim=-1)
+                    ref_tokens = inputs["text_labels"]
+                    if not self.cfg.get("use_film_cond", None):
+                        # Mask tokens where agent is inactive. This results in an optimistic view of things
+                        pred_tokens = torch.where(
+                            inputs["target_activity"].squeeze(-1) != 0,
+                            pred_tokens,
+                            torch.ones_like(pred_tokens, dtype=torch.long) * (-100)
+                        )  # -100 will be skipped by tokens_to_text()
+                        ref_tokens = torch.where(
+                            inputs["target_activity"].squeeze(-1) != 0,
+                            ref_tokens,
+                            torch.ones_like(ref_tokens, dtype=torch.long) * (-100)
+                        ) 
 
-                    ref_text = tokens_to_text(inputs["text_labels"], tok)
+                    ref_text = tokens_to_text(ref_tokens, tok)
                     pred_text = tokens_to_text(pred_tokens, tok)
                     self.bleu.update(name='train', refs=ref_text, hyps=pred_text)
 
@@ -1405,6 +1609,8 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                     self.text_eos_acc.update(name='train', refs=inputs["text_labels"], hyps=pred_tokens)
 
                     if self.cfg.get("do_user_asr", None):
+                        user_ref_text = tokens_to_text(user_ref_tokens, tok)
+                        user_pred_text = tokens_to_text(user_pred_tokens, tok)
                         self.user_bleu.update(name='train', refs=user_ref_text, hyps=user_pred_text)
                         self.user_text_bos_acc.update(name='train', refs=inputs["user_text_labels"], hyps=user_pred_tokens)
                         self.user_text_eos_acc.update(name='train', refs=inputs["user_text_labels"], hyps=user_pred_tokens)
@@ -1783,9 +1989,9 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             print(f"Cache disabled, so no cache class was initialized")
         
         # Call reset_input_and_kv_cache to enable cache for TransformerARSpeechDecoder
-        self.speech_generation.reset_input_and_kv_cache(use_cache=True) #if llm_use_cache else False)
-        gen_text = torch.empty(B, T, device=self.device, dtype=torch.long)
-        gen_audio = torch.empty(B, T, self._num_codebooks, device=self.device, dtype=torch.long)
+        if not ignore_speech_gen:
+            self.speech_generation.reset_input_and_kv_cache(use_cache=True)
+            gen_audio = torch.empty(B, T, self._num_codebooks, device=self.device, dtype=torch.long)
 
         gen_text = torch.empty(B, T, device=self.device, dtype=torch.long)
 
@@ -1846,6 +2052,17 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         # -- Autoregressive loop ----------
         for t in range(1, T):
             last_emb = self.embed_tokens(gen_text[:, t - 1])
+            if self.cfg.get("skip_agent_pad_input", None):
+                agent_padding_pos = gen_text[:, t - 1].eq(self.text_pad_id)
+                if input_text is not None:
+                    user_padding_pos = input_text.eq(self.text_pad_id)
+                    padding_pos = user_padding_pos & ~agent_padding_pos
+                    agent_padding_pos = agent_padding_pos & ~user_padding_pos
+
+                    input_embeds[:, t] = input_embeds[:, t].masked_fill(padding_pos.unsqueeze(-1), 0.0)
+
+                last_emb = last_emb.masked_fill(agent_padding_pos.unsqueeze(-1), 0.0)
+
             input_embeds[:, t] += last_emb
             
             if not ignore_speech_gen:
@@ -2067,7 +2284,8 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             self.perception = fully_shard(self.perception, **fsdp_config)
             if not self.cfg.get("ignore_speech_gen", None):
                 self.speech_generation = fully_shard(self.speech_generation, **fsdp_config)
-
+            if self.cfg.get("use_film_cond", None):
+                self.agent_film = fully_shard(self.agent_film, **fsdp_config)
 
 
     def generate_silence_tokens(self, time_steps: int, num_codebooks: int) -> torch.Tensor:

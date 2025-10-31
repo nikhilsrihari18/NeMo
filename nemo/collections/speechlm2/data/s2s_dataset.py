@@ -129,6 +129,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         force_align_user_text: bool = False,
         force_align_agent_text: bool = False,
         force_align_device: str | None = None,
+        skip_agent_word_padding: bool = False
     ):
         self.tokenizer = tokenizer
         self.use_word_pad = use_word_pad
@@ -147,6 +148,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         self.force_align_user_text = force_align_user_text
         self.force_align_agent_text = force_align_agent_text
         self.force_align_device = force_align_device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.skip_agent_word_padding = skip_agent_word_padding
 
         # Initialize force aligner if needed
         self.force_aligner = None
@@ -257,7 +259,8 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
                 is_agent=True,
                 model_version=self.model_version,
                 data_format=data_format, 
-                delay_user_txt_by=0
+                delay_user_txt_by=0, 
+                skip_word_padding=True
             )
         else:
             target_tokens = torch.ones_like(source_tokens) * pad_id
@@ -657,7 +660,8 @@ def collate_token_channel(
     is_agent: bool = False,
     model_version: str = 'v1',
     data_format: str = 'shars',
-    delay_user_txt_by: int = 0
+    delay_user_txt_by: int = 0,
+    skip_word_padding: bool = False
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     
     pad_id = get_pad_id(tokenizer)
@@ -681,7 +685,8 @@ def collate_token_channel(
             chat_start_ids=chat_start_ids,
             model_version=model_version, 
             data_format=data_format,
-            delay_user_txt_by=delay_user_txt_by
+            delay_user_txt_by=delay_user_txt_by,
+            skip_word_padding=skip_word_padding
         )
         for c in cuts
     ]
@@ -777,14 +782,15 @@ def build_token_channel(
         chat_start_ids: list[int] | None = None,
         model_version: str | None = 'v1',
         data_format: str = 'shars',
-        delay_user_txt_by: int = 0
+        delay_user_txt_by: int = 0,
+        skip_word_padding: bool = False
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     diagnostic = f"Extra info: {cut.id=}"
     if getattr(cut, "shard_origin", None) is not None:
         diagnostic = f"{diagnostic} {cut.shard_origin=}"
 
     total = compute_num_frames(cut.duration, frame_length, cut.sampling_rate)
-    tokens = torch.ones(total, dtype=torch.long) * pad_id
+    tokens = torch.ones(total + delay_user_txt_by, dtype=torch.long) * pad_id
     activity_mask = torch.zeros_like(tokens)
     
     agent_bos_id = get_chat_start_ids(tokenizer, True, version=model_version)
@@ -888,7 +894,8 @@ def build_token_channel(
                             threshold=None, eos_buffer=None
                         )
                     )
-                    text_ids = _insert_word_padding(text_ids, pad_id, word_pad_id, word_epad_id)
+                    if not skip_word_padding:
+                        text_ids = _insert_word_padding(text_ids, pad_id, word_pad_id, word_epad_id)
                     
                     text_ids = torch.cat([torch.as_tensor(bos_ids), text_ids])
                 
@@ -913,7 +920,7 @@ def build_token_channel(
                 try:
                     tokens[start_pos:end_pos] = text_ids
                     # Keep padding within segments unmasked
-                    activity_mask[max(start_pos-delay_user_txt_by-1,0):end_pos] = 1  # -delay_user_txt_by-1 to see the transition from padding to bos
+                    activity_mask[max(start_pos-delay_user_txt_by-1,0):end_pos] = 1  # delay_user_txt_by 1 to see the transition from padding to bos
                 except Exception as e:
                     raise RuntimeError(f"{tokens.shape=} {start_pos=} {end_pos=} {text_ids.shape=} {diagnostic}") from e
 
@@ -1160,6 +1167,16 @@ def _correct_ebos(text_ids, eos_id, role_bos_ids, pad_id, word_pad_id, word_epad
                     text_ids[idx] = word_pad_id
                 else:
                     text_ids[idx] = word_epad_id
+        # Advance if pad_ids right after bos so the latter is just before first useful token
+        if len(role_bos_ids) == 1: # TODO: generalize to other cases
+            inc = 1
+            needs_advance = False
+            while idx+inc < text_ids.shape[0] and text_ids[idx+inc] == pad_id:  
+                text_ids[idx+inc-1] = pad_id
+                needs_advance = True
+                inc += 1
+            if needs_advance:
+                text_ids[idx+inc-1] = role_bos_ids[0]
     
     eos_idx = (text_ids == eos_id).nonzero(as_tuple=False).flatten()
     for idx in eos_idx:

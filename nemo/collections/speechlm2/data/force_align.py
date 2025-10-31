@@ -39,6 +39,7 @@ class ForceAligner:
         self.wav2vec2_aligner = None
         self.wav2vec2_bundle = None
         self._load_wav2vec2_model()
+        self.stream = torch.cuda.Stream(device=self.device)
     
     def _load_wav2vec2_model(self):
         """Load the wav2vec2 model and related components."""
@@ -74,12 +75,12 @@ class ForceAligner:
         # Collect all user supervisions
         for cut in cuts:
             for supervision in cut.supervisions:
-                if roles is None or supervision.speaker in roles:
+                if roles is None or supervision.speaker in roles and supervision.duration > 0.1:
                     user_supervisions.append(supervision)
                     user_cuts.append(cut)
         
         if not user_supervisions:
-            logging.info("No user supervisions found for force alignment")
+            logging.info("No supervisions found for force alignment")
             return
 
         # logging.info(f"[DEBUG] Performing force alignment on {len(user_supervisions)} user audio segments")
@@ -158,6 +159,7 @@ class ForceAligner:
         
         return alignments
     
+    @torch.no_grad()
     def _wav2vec2_align(self, waveform: torch.Tensor, sample_rate: int, transcript: str) -> Optional[List[Dict[str, Any]]]:
         """
         Perform forced alignment using wav2vec2.
@@ -177,25 +179,43 @@ class ForceAligner:
             logging.warning(f"No valid words found in transcript: {transcript}")
             return None
         
-        if sample_rate != 16000:
-            waveform = torchaudio.functional.resample(waveform, sample_rate, 16000)
-            sample_rate = 16000
-        
-        device = torch.device(self.device)
-        waveform = waveform.to(device)
-        
-        with torch.no_grad():
+        # Ensure contiguous CPU input
+        waveform = waveform.contiguous()
+
+        # 1) Do GPU work on a private stream
+        with torch.cuda.stream(self.stream):
+            device = torch.device(self.device)
+            waveform = waveform.to(device)
+            
+            if sample_rate != 16000:
+                waveform = torchaudio.functional.resample(waveform, sample_rate, 16000)
+                sample_rate = 16000
+            
+            # with torch.no_grad():
             emission, _ = self.wav2vec2_model(waveform)
+            
+            # 2) Async copy back to pinned host buffer
+            emission_host = torch.empty(
+                size=emission.shape,
+                dtype=emission.dtype,
+                device="cpu",
+                pin_memory=True,
+            )
+            emission_host.copy_(emission, non_blocking=True)
+            
+            ratio = waveform.size(1) / emission.size(1) / 16000
+
+        # 3) We must sync before returning the CPU tensor
+        self.stream.synchronize()
         
         tokens = self.wav2vec2_tokenizer(transcript_words)
-        token_spans = self.wav2vec2_aligner(emission[0], tokens)
+        token_spans = self.wav2vec2_aligner(emission_host[0], tokens)
         
         if not token_spans:
             logging.warning(f"No alignment found for transcript: {transcript}")
             return None
         
         word_segments = []
-        ratio = waveform.size(1) / emission.size(1) / 16000
         
         for word, spans in zip(transcript_words, token_spans):
             if spans:

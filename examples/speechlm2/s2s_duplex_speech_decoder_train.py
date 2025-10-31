@@ -88,15 +88,15 @@ def train(cfg):
     use_chat_template = cfg.model.get("use_chat_template", None)
     user_only = cfg.model.get("user_only", None)
     delay_user_txt_by = cfg.model.get("delay_user_txt_by", 0)
-    force_align_user_text = cfg.model.get("force_align_user_text", False)
-    force_align_agent_text = cfg.data.get("force_align_agent_text", False)
-    force_align_device = cfg.model.get("force_align_device", None)
-
+    force_align_user_text = cfg.data.get("force_align_user_text", None)
+    force_align_agent_text = cfg.data.get("force_align_agent_text", None)
+    skip_agent_word_padding = cfg.data.get("skip_agent_word_padding", None)
+   
     if cfg.model.pretrained_llm.endswith('v2'):
         model_version = 'v2-short'
     else:
         model_version = 'v1'
-
+    
     dataset = DuplexS2SDataset(
         tokenizer=model.tokenizer,
         frame_length=cfg.data.frame_length,
@@ -113,12 +113,11 @@ def train(cfg):
         model_version=model_version,
         force_align_user_text=force_align_user_text,
         force_align_agent_text=force_align_agent_text,
-        force_align_device=force_align_device,
+        skip_agent_word_padding=skip_agent_word_padding
     )
     datamodule = DataModule(cfg.data, tokenizer=model.tokenizer, dataset=dataset)
 
     trainer.fit(model, datamodule)
-
-
+   
 if __name__ == "__main__":
     train()
