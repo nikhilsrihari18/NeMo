@@ -212,11 +212,7 @@ class FiLMConditioner(nn.Module):
         gb = self.cond(z)                        # [B, 2*out_dim]
         gamma, beta = gb.split(x.size(-1), dim=-1)
 
-        assert_finite("gamma", gamma)
-        assert_finite("beta", beta)
-
         return gamma * x + beta
-
 
 
 class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
