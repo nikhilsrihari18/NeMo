@@ -94,25 +94,33 @@ class ResultsLogger:
             # save audio
             sample_id = samples_id[i][:150]  # make sure that sample id is not too big
             out_audio_path = os.path.join(self.audio_save_path, f"{name}_{sample_id}.wav")
-            self.merge_and_save_audio(out_audio_path, pred_audio[i], pred_audio_sr, user_audio[i], user_audio_sr)
-            # create a wav with eou prediction for debug purposes
-            if eou_pred is not None:
-                out_audio_path_eou = os.path.join(self.audio_save_path, f"{name}_{sample_id}_eou.wav")
-                repeat_factor = int(pred_audio_sr / fps)
-                eou_pred_wav = (
-                    eou_pred[i].unsqueeze(0).unsqueeze(-1).repeat(1, 1, repeat_factor)
-                )  # (B, T, repeat_factor)
-                eou_pred_wav = eou_pred_wav.view(1, -1)  # (B, T * repeat_factor)
-                eou_pred_wav = eou_pred_wav.float() * 0.8  #  make 1 audible and keep 0 as total silence
-                torchaudio.save(out_audio_path_eou, eou_pred_wav.squeeze().unsqueeze(0).detach().cpu(), pred_audio_sr)
+            if pred_audio is None:
+                out_dict = {
+                    "target_text": refs[i],
+                    "pred_text": hyps[i],
+                    "audio_path": os.path.relpath(out_audio_path, self.save_path),
+                }
+            else:
+                self.merge_and_save_audio(out_audio_path, pred_audio[i], pred_audio_sr, user_audio[i], user_audio_sr)
+                # create a wav with eou prediction for debug purposes
+                if eou_pred is not None:
+                    out_audio_path_eou = os.path.join(self.audio_save_path, f"{name}_{sample_id}_eou.wav")
+                    repeat_factor = int(pred_audio_sr / fps)
+                    eou_pred_wav = (
+                        eou_pred[i].unsqueeze(0).unsqueeze(-1).repeat(1, 1, repeat_factor)
+                    )  # (B, T, repeat_factor)
+                    eou_pred_wav = eou_pred_wav.view(1, -1)  # (B, T * repeat_factor)
+                    eou_pred_wav = eou_pred_wav.float() * 0.8  #  make 1 audible and keep 0 as total silence
+                    torchaudio.save(out_audio_path_eou, eou_pred_wav.squeeze().unsqueeze(0).detach().cpu(), pred_audio_sr)
 
-            # cache metadata
-            out_dict = {
-                "target_text": refs[i],
-                "pred_text": hyps[i],
-                "speech_pred_transcribed": asr_hyps[i],
-                "audio_path": os.path.relpath(out_audio_path, self.save_path),
-            }
+                # cache metadata
+                out_dict = {
+                    "target_text": refs[i],
+                    "pred_text": hyps[i],
+                    "speech_pred_transcribed": asr_hyps[i],
+                    "audio_path": os.path.relpath(out_audio_path, self.save_path),
+                }
+
             if results is not None:
                 if tokenizer is not None:
                     out_dict['tokens_text'] = " ".join(tokenizer.ids_to_tokens(results['tokens_text'][i]))

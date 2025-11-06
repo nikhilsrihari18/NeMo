@@ -87,8 +87,15 @@ class ForceAligner:
 
         audio_tensors = []
         texts = []
+        valid_supervision_indices = []
 
         for i, (supervision, cut) in enumerate(zip(user_supervisions, user_cuts)):
+            # Strip timestamps and check if text is empty
+            stripped_text = self._strip_timestamps(supervision.text)
+            if not stripped_text.strip():
+                # Skip supervisions with empty text after stripping timestamps
+                continue
+            
             user_cut = cut.truncate(offset=supervision.start, duration=supervision.duration)
             audio = user_cut.load_audio()
 
@@ -110,19 +117,27 @@ class ForceAligner:
                 audio = resampler(audio)
 
             audio_tensors.append(audio)
-            texts.append(self._strip_timestamps(supervision.text))
+            texts.append(stripped_text)
+            valid_supervision_indices.append(i)
 
             # Debug log a few samples
             # if i < 3:
             #     logging.info(f"[DEBUG] Original text ({i}): {supervision.text}")
             #     logging.info(f"[DEBUG] Audio shape: {audio.shape}, duration: {supervision.duration:.2f}s")
 
+        # Check if we have any valid supervisions after filtering
+        if not audio_tensors:
+            logging.info("No supervisions with valid text found for force alignment after filtering empty transcripts")
+            return
+
         # Run batch alignment
         alignments_batch = self._wav2vec2_batch_align_tensors(audio_tensors, texts)
 
         for i, alignment_result in enumerate(alignments_batch):
             if alignment_result is not None:
-                original_text = user_supervisions[i].text
+                # Use valid_supervision_indices to map back to the original supervision
+                supervision_idx = valid_supervision_indices[i]
+                original_text = user_supervisions[supervision_idx].text
                 timestamped_text = self._convert_wav2vec2_alignment_to_timestamped_text(alignment_result, original_text)
                 # logging.info(f"[DEBUG] Aligned text ({i}): {timestamped_text}")
 
@@ -134,7 +149,7 @@ class ForceAligner:
                 #             logging.info(f"  {word_info['word']} {word_info['start']:.3f}s - {word_info['end']:.3f}s")
 
                 # Update supervision text with alignment
-                user_supervisions[i].text = timestamped_text
+                user_supervisions[supervision_idx].text = timestamped_text
     
     def _wav2vec2_batch_align_tensors(self, audio_tensors: List[torch.Tensor], texts: List[str]) -> List[Optional[List[Dict[str, Any]]]]:
         """

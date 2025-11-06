@@ -1828,6 +1828,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                     )
                 else:
                     asr_hyps = None
+                    pred_audio = None
 
                 self.results_logger.update(
                     name=name,
@@ -2000,6 +2001,21 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             input_embeds[:, 0] = self._get_bos_embedding()  # Note: overwriting instead of adding in orig solution
             # TODO: append instead of overwriting
 
+        # Initialize llm_kwargs regardless of ignore_speech_gen since it's used later
+        if llm_use_cache:
+            if self.cfg.get("llm", {}).get("architecture", "transformers") == "nemotron_h":
+                llm_kwargs = {
+                    "attention_mask": torch.ones_like(source_encoded[:, :1, 0]), # shape (B, 1)
+                    "cache_position": torch.arange(1, device=source_encoded.device, dtype=source_encoded.dtype), # shape (1)
+                }
+                print(f"LLM kwargs initialized during inference")
+            else:
+                llm_kwargs = {}
+                print(f"LLM kwargs initialized empty during inference")
+        else:
+            llm_kwargs = {}
+            print(f"LLM kwargs initialized empty during inference")
+
         if not ignore_speech_gen:   #  !!!!
             first_audio = torch.full(
                 [B, 1, self._num_codebooks],
@@ -2007,20 +2023,6 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 device=self.device,
                 dtype=torch.long,
             ) # type: ignore
-            if llm_use_cache:
-                if self.cfg.get("llm", {}).get("architecture", "transformers") == "nemotron_h":
-                    llm_kwargs = {
-                        "attention_mask": torch.ones_like(source_encoded[:, :1, 0]), # shape (B, 1)
-                        "cache_position": torch.arange(1, device=source_encoded.device, dtype=source_encoded.dtype), # shape (1)
-                    }
-                    print(f"LLM kwargs initialized during inference")
-                else:
-                    llm_kwargs = {}
-                    print(f"LLM kwargs initialized empty during inference")
-            else:
-                llm_kwargs = {}
-                print(f"LLM kwargs initialized empty during inference")    
-        
         else:
             first_audio = None
 

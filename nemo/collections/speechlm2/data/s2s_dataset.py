@@ -177,19 +177,33 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
             filtered_cuts = []
             skipped_cuts = []
             for cut in cuts:
-                if any(
-                    s.text.strip() for s in cut.supervisions if s.speaker in self.input_roles
-                ) and any(  # Ensure time stamps are present
-                    '<|' in s.text for s in cut.supervisions if s.speaker in self.input_roles
-                ):
+                # Combine text of all relevant supervisions
+                combined_text = " ".join(
+                    _strip_timestamps(s.text) for s in cut.supervisions if s.speaker in self.input_roles
+                ).strip()
+
+                # Keep cut if there is any non-empty text after stripping timestamps
+                if combined_text:
                     filtered_cuts.append(cut)
                 else:
                     skipped_cuts.append(cut.id)
+
+            # Log skipped cuts
             if skipped_cuts:
-                logging.warning(f"Skipped {len(skipped_cuts)} cuts with empty input text or no timestamps. Skipped cut ids: {', '.join(skipped_cuts)}")
+                logging.warning(
+                    f"Skipped {len(skipped_cuts)} cuts with empty input text. "
+                    f"Skipped cut ids: {', '.join(skipped_cuts)}"
+                )
+
+            # Handle case where all cuts are filtered out
             if not filtered_cuts:
-                logging.warning(f"All cuts were filtered out! Original batch size: {len(cuts)}. Returning minimal valid batch to continue training.")
+                logging.warning(
+                    f"All cuts were filtered out! Original batch size: {len(cuts)}. "
+                    "Returning minimal valid batch to continue training."
+                )
                 return self._create_minimal_batch()
+
+            # Keep only valid cuts
             cuts = CutSet.from_cuts(filtered_cuts)
         else:
             data_format = "shars"
