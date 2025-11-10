@@ -20,7 +20,7 @@ from nemo.utils import logging
 
 def maybe_install_lora(model):
     """Add LoRA adapters to a model, using HuggingFace PEFT library."""
-    if "lora" in model.cfg:
+    if "lora" in model.cfg and model.cfg.lora is not None:
         assert hasattr(model, "cfg") and isinstance(model.cfg, DictConfig)
         assert hasattr(model, "llm") and isinstance(model.llm, PreTrainedModel)
         assert "prevent_freeze_params" in model.cfg and isinstance(model.cfg.prevent_freeze_params, (list, ListConfig))
