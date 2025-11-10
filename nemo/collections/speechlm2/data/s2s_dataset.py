@@ -825,10 +825,11 @@ def build_token_channel(
             i_start = fst_pos
             i_end = i_start + 1
             
-            if (
-                data_format == 'shars' and use_alignment_items and 
-                supervision.alignment is not None and len(supervision.alignment['word']) > 0
-            ):                
+            if False:
+            # (
+            #     data_format == 'shars' and use_alignment_items and 
+            #     supervision.alignment is not None and len(supervision.alignment['word']) > 0
+            # ):                
                 prev_end_pos = 0
                 for idx, alignment in enumerate(supervision.alignment['word']):
                     if alignment is None:

@@ -1487,7 +1487,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
 
                     loss_w = self.cfg.get("loss_weights", None)
                     if loss_w is None:
-                        loss_w = [20, 5, 10, 30, 5]
+                        loss_w = [0.1, 0.1, 1, 0.1, 0.1]
                     text_loss = (
                         agent_text_loss + agent_eos_loss * loss_w[0] + agent_bos_loss * loss_w[1] +
                         loss_w[2] * user_text_loss + user_eos_loss * loss_w[3] + user_bos_loss * loss_w[4]

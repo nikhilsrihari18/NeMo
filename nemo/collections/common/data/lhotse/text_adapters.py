@@ -121,6 +121,34 @@ class LhotseTextAdapter:
                     yield TextExample(line, language=self.language)
 
 
+@dataclass
+class LhotseTextJsonlAdapter:
+    """
+    ``LhotseTextJsonlAdapter`` is used to read a JSONL file and wrap
+    the text field of each line into a ``TextExample``.
+    """
+
+    paths: Union[Pathlike, list[Pathlike]]
+    language: str | None = None
+    text_field: str = "text"
+    shuffle_shards: bool = False
+    shard_seed: Union[int, Literal["trng", "randomized"]] = "trng"
+
+    def __post_init__(self):
+        self.paths = expand_sharded_filepaths(self.paths)
+
+    def __iter__(self) -> Iterator[TextExample]:
+        paths = self.paths
+        if self.shuffle_shards:
+            seed = resolve_seed(self.shard_seed)
+            random.Random(seed).shuffle(paths)
+        for path in paths:
+            for data in load_jsonl(path):
+                if self.text_field not in data:
+                    continue
+                yield TextExample(data[self.text_field], language=self.language)
+
+
 @registered_prompt_format_fn(TextExample)
 def default_text_example_prompt_format_fn(example: TextExample, prompt):
     # It doesn't really make sense to prompt format a single line text example,
@@ -468,6 +496,12 @@ class NeMoMultimodalConversationJsonlAdapter:
         else:
             yield from self._iter_jsonl()
 
+    def _should_skip(self, example: dict) -> bool:
+        custom = example.get("custom")
+        if custom is None:
+            return False
+        return bool(custom.get("_skipme", False))
+
     def _get_rng(self) -> random.Random:
         seed = resolve_seed(self.shard_seed) + self.epoch
         return random.Random(seed)
@@ -495,10 +529,12 @@ class NeMoMultimodalConversationJsonlAdapter:
                     recording, audio_path = next(tar)
                     audio_path = str(audio_path)
                     cut = recording.to_cut()
-                    assert audio_path == turn['value'], (
-                        f"Mismatch between JSONL and tar. JSONL defines audio path={turn['value']} but we got "
-                        f"the following from tar {audio_path=}.\nBad inputs in: {jsonl_path=} {tar_path=}"
-                    )
+                    assert (
+                        audio_path == turn['value']
+                    ), f"Mismatch between JSONL and tar. JSONL defines audio path={turn['value']} but we got the following from tar {audio_path=}"
+                    assert (
+                        cut.duration == turn["duration"]
+                    ), f"Mismatch between JSONL and tar. JSONL defines audio duration={turn['duration']} but we got the following from tar {cut.duration=}"
                     cuts.append(cut)
                 if self._should_skip(data):
                     continue  # Skip only after tar has been iterated, otherwise there will be data mismatch
@@ -569,6 +605,8 @@ class NeMoMultimodalConversationJsonlAdapter:
                     ],
                     token_equivalent_duration=self.token_equivalent_duration,
                 )
+
+        self.epoch += 1
 
 
 class NeMoMultimodalConversationTarWriter:
