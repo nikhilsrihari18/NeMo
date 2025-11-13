@@ -1874,6 +1874,11 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
 
     def validation_step(self, batch: dict, batch_idx: int):
 
+        r = dist.get_rank() if dist.is_initialized() else -1
+        print(f"[DEBUG] entered train_step on rank={r}, LOCAL_RANK={os.environ.get('LOCAL_RANK')}")
+        import debugpy
+        debugpy.breakpoint()
+
         # Update speaker embedding to reflect the one in the prompt during inference
         if (
             not self.cfg.get("ignore_speech_gen", None) and
@@ -2050,7 +2055,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 input_signal=input_signal, input_signal_length=input_signal_lens, return_encoder_emb=True
             )
         B, T_local, H = source_encoded.shape 
-        T_local = torch.floor(T_local * self.cfg.get("inference_extra_decoding_length_factor", 1)).int()
+        T_local = int(T_local * self.cfg.get("inference_extra_decoding_length_factor", 1))
 
         # Determine decoding length and pad if FSDP
         print("self._use_fsdp", self._use_fsdp)
@@ -2099,10 +2104,10 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
 
         if not ignore_speech_gen:
             self.speech_generation.reset_input_and_kv_cache(use_cache=True)
-            gen_audio = torch.empty(B, T, self._num_codebooks, device=self.device, dtype=torch.long)
+            gen_audio = torch.zeros(B, T, self._num_codebooks, device=self.device, dtype=torch.long)
 
-        gen_text = torch.empty(B, T, device=self.device, dtype=torch.long)
-        user_gen_text = torch.empty(B, T, device=self.device, dtype=torch.long) if do_user_asr else None
+        gen_text = torch.zeros(B, T, device=self.device, dtype=torch.long)
+        user_gen_text = torch.zeros(B, T, device=self.device, dtype=torch.long) if do_user_asr else None
 
         # -- First step, use init tokens  -------
         if self.system_prompt is not None or self.use_chat_template:
