@@ -1902,6 +1902,13 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                     dataset_batch["source_audio_lens"],
                 )
 
+            if self.cfg.get("do_user_asr", None):
+                user_text = results.get("user_text")
+                user_text_with_special_tokens = results.get("user_text_with_special_tokens")
+            else:
+                user_text = None
+                user_text_with_special_tokens = None
+
             # Get ASR hypotheses for the generated audio
             # torchaudio resample is fragile to bfloat16 default dtype as well
             with fp32_precision():  # resample is fragile to bfloat16 default dtype
@@ -1929,6 +1936,8 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                     fps=self.source_fps,
                     results=results if self.cfg.get("dump_tokens_text", False) else None,
                     tokenizer=self.tokenizer,
+                    user_text=user_text,
+                    user_text_with_special_tokens=user_text_with_special_tokens,
                 )
 
             # Collect results for JSON saving
@@ -1945,6 +1954,10 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 if 'instructions' in dataset_batch and dataset_batch['instructions'] is not None:
                     result_entry['sys_prompt'] = dataset_batch['instructions_raw_text'][i]
                     result_entry['call_response'] = dataset_batch['call_responses_raw_text'][i]
+                if user_text is not None:
+                    result_entry["pred_user_text"] = user_text[i]
+                if user_text_with_special_tokens is not None:
+                    result_entry["pred_user_text_with_special_tokens"] = user_text_with_special_tokens[i]
                 self.validation_results[name].append(result_entry)
             # import pdb; pdb.set_trace()
             logging.info(f"dataset_batch['target_texts']: {dataset_batch['target_texts']}")
@@ -2082,11 +2095,14 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             print(f"Cache disabled, so no cache class was initialized")
         
         # Call reset_input_and_kv_cache to enable cache for TransformerARSpeechDecoder
+        do_user_asr = self.cfg.get("do_user_asr", None)
+
         if not ignore_speech_gen:
             self.speech_generation.reset_input_and_kv_cache(use_cache=True)
             gen_audio = torch.empty(B, T, self._num_codebooks, device=self.device, dtype=torch.long)
 
         gen_text = torch.empty(B, T, device=self.device, dtype=torch.long)
+        user_gen_text = torch.empty(B, T, device=self.device, dtype=torch.long) if do_user_asr else None
 
         # -- First step, use init tokens  -------
         if self.system_prompt is not None or self.use_chat_template:
@@ -2135,6 +2151,8 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         )
 
         gen_text[:, 0] = ans["text_logits"][:, -1].argmax(dim=-1)
+        if do_user_asr and "user_text_logits" in ans:
+            user_gen_text[:, 0] = ans["user_text_logits"][:, -1].argmax(dim=-1)
         if not ignore_speech_gen:
             gen_audio[:, 0] = ans["audio_logits"][:, -1].argmax(dim=-1)
 
@@ -2193,6 +2211,8 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 llm_kwargs=llm_kwargs,
             )
             gen_text[:, t] = ans["text_logits"][:, -1].argmax(dim=-1)
+            if do_user_asr and "user_text_logits" in ans:
+                user_gen_text[:, t] = ans["user_text_logits"][:, -1].argmax(dim=-1)
             if not ignore_speech_gen:
                 gen_audio[:, t] = ans["audio_logits"][:, -1].argmax(dim=-1)
 
@@ -2241,6 +2261,16 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             gen_text = gen_text[:, :T_local]
             if not ignore_speech_gen:
                 gen_audio = gen_audio[:, :T_local]
+            if do_user_asr:
+                user_gen_text = user_gen_text[:, :T_local]
+
+        if do_user_asr:
+            user_text = tokens_to_text(
+                user_gen_text, tokenizer=self.tokenizer.tokenizer, text_only=True
+            )
+            user_text_with_special = tokens_to_str(
+                user_gen_text, lengths, tokenizer=self.tokenizer, pad_id=self.text_pad_id
+            )
 
         ans = {
             "text_with_special_tokens": tokens_to_str(gen_text, lengths, tokenizer=self.tokenizer, pad_id=self.text_pad_id),
@@ -2249,6 +2279,9 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             "tokens_audio": gen_audio,
             "tokens_len": lengths,
         }
+        if do_user_asr:
+            ans["user_text_with_special_tokens"] = user_text_with_special
+            ans["user_text"] = user_text
 
         ans["audio"] = ans["audio_len"] = None
         if not ignore_speech_gen:
@@ -2786,8 +2819,10 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             cache = None
         # Call reset_input_and_kv_cache to enable cache for TransformerARSpeechDecoder
         self.speech_generation.reset_input_and_kv_cache(use_cache=True)
+        do_user_asr = self.cfg.get("do_user_asr", None)
         gen_text = torch.empty(B, T, device=self.device, dtype=torch.long)
         gen_audio = torch.empty(B, T, self._num_codebooks, device=self.device, dtype=torch.long)
+        user_gen_text = torch.empty(B, T, device=self.device, dtype=torch.long) if do_user_asr else None
 
         # First step, use speech_delay token
         input_embeds[:, 0] += self._get_bos_embedding()
@@ -2811,6 +2846,8 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             loss_mask=None
         )
         gen_text[:, 0] = ans["text_logits"][:, -1].argmax(dim=-1)
+        if do_user_asr and "user_text_logits" in ans:
+            user_gen_text[:, 0] = ans["user_text_logits"][:, -1].argmax(dim=-1)
         gen_audio[:, 0] = ans["audio_logits"][:, -1].argmax(dim=-1)
 
         # Autoregressive loop
@@ -2824,6 +2861,8 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 input_audio_tokens=current_audio
             )
             gen_text[:, t] = ans["text_logits"][:, -1].argmax(dim=-1)
+            if do_user_asr and "user_text_logits" in ans:
+                user_gen_text[:, t] = ans["user_text_logits"][:, -1].argmax(dim=-1)
             gen_audio[:, t] = ans["audio_logits"][:, -1].argmax(dim=-1)
 
         # remove parts corresponding to system prompt
@@ -2831,11 +2870,23 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
 
         gen_text = gen_text[:, sys_prompt_batch_len:]
         gen_audio = gen_audio[:, sys_prompt_batch_len:]
+        if do_user_asr:
+            user_gen_text = user_gen_text[:, sys_prompt_batch_len:]
 
         # Trim back to local length if padded
         if self._use_fsdp and T > T_local:
             gen_text = gen_text[:, :T_local]
             gen_audio = gen_audio[:, :T_local]
+            if do_user_asr:
+                user_gen_text = user_gen_text[:, :T_local]
+
+        if do_user_asr:
+            user_text = tokens_to_text(
+                user_gen_text, tokenizer=self.tokenizer.tokenizer, text_only=True
+            )
+            user_text_with_special = tokens_to_str(
+                user_gen_text, lengths, tokenizer=self.tokenizer, pad_id=self.text_pad_id
+            )
 
         ans = {
             "text": tokens_to_str(gen_text, lengths, tokenizer=self.tokenizer, pad_id=self.text_pad_id),
@@ -2843,6 +2894,9 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             "tokens_audio": gen_audio,
             "tokens_len": lengths,
         }
+        if do_user_asr:
+            ans["user_text_with_special_tokens"] = user_text_with_special
+            ans["user_text"] = user_text
 
         if decode_audio:
             gen_audio_codes = replace_control_speech_codes(gen_audio, self._control_codes)

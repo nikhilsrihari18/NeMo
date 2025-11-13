@@ -15,6 +15,7 @@ import json
 import os
 import shutil
 from collections import defaultdict
+from typing import List, Optional
 
 import torch
 import torchaudio
@@ -86,6 +87,8 @@ class ResultsLogger:
         fps: float = None,
         results=None,
         tokenizer=None,
+        user_text: Optional[List[str]] = None,
+        user_text_with_special_tokens: Optional[List[str]] = None,
     ) -> None:
 
         out_json_path = os.path.join(self.matadata_save_path, f"{name}.json")
@@ -126,6 +129,12 @@ class ResultsLogger:
                     out_dict['tokens_text'] = " ".join(tokenizer.ids_to_tokens(results['tokens_text'][i]))
                 else:
                     out_dict['tokens_text'] = results['tokens_text'][i].tolist()
+
+            if user_text is not None:
+                out_dict["pred_user_text"] = user_text[i]
+            if user_text_with_special_tokens is not None:
+                out_dict["pred_user_text_with_special_tokens"] = user_text_with_special_tokens[i]
+
             out_dicts.append(out_dict)
         # uses append here to avoid needs to cache
         with open(out_json_path, 'a+', encoding='utf-8') as fout:
