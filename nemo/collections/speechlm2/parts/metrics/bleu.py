@@ -15,18 +15,23 @@ from collections import defaultdict
 
 import sacrebleu
 import torch
+import torchmetrics
 from whisper_normalizer.english import EnglishTextNormalizer
 
 from nemo.utils import logging
 
 
-class BLEU:
+class BLEU(torchmetrics.Metric):
     """
     Computes BLEU scores on text predictions.
     By default, uses Whisper's EnglishTextNormalizer on hypotheses and references.
+    
+    This is a PyTorch Lightning compatible metric that accumulates references
+    and hypotheses across batches and computes corpus-level BLEU scores.
     """
 
     def __init__(self, normalize: bool = True, normalizer=None, verbose: bool = True):
+        super().__init__()
         self.verbose = verbose
         if normalize:
             if normalizer is None:
@@ -36,11 +41,16 @@ class BLEU:
         else:
             self.normalizer = _identity
 
+        # Note: For text metrics that store lists of strings, we cannot use
+        # add_state() with tensor types. Instead, we manually manage state.
+        # This means distributed training would need custom all_gather logic.
         self._refs = defaultdict(list)
         self._hyps = defaultdict(list)
 
     def reset(self):
-        return self
+        """Reset the metric state for a new epoch/validation phase."""
+        self._refs.clear()
+        self._hyps.clear()
 
     def update(self, name: str, refs: list[str], hyps: list[str]) -> None:
         for ref, hyp in zip(refs, hyps):
@@ -51,13 +61,17 @@ class BLEU:
                 logging.info(f"[REF]\t{ref}\n[HYP]\t{hyp} [{asrb:.2f}]")
 
     def compute(self) -> dict[str, torch.Tensor]:
+        """Compute the corpus-level BLEU scores from accumulated data."""
         corpus_metric = {}
         for name in self._refs.keys():
             metric = torch.tensor(sacrebleu.corpus_bleu(self._hyps[name], [self._refs[name]]).score)
             corpus_metric[f"txt_bleu_{name}"] = metric
-        corpus_metric["txt_bleu"] = torch.stack(list(corpus_metric.values())).mean()
-        self._refs.clear()
-        self._hyps.clear()
+        
+        if corpus_metric:
+            corpus_metric["txt_bleu"] = torch.stack(list(corpus_metric.values())).mean()
+        else:
+            corpus_metric["txt_bleu"] = torch.tensor(0.0)
+        
         return corpus_metric
 
 

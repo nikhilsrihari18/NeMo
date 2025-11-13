@@ -13,6 +13,7 @@
 # limitations under the License.
 from collections import defaultdict
 import torch
+import torchmetrics
 from nemo.utils import logging
 
 
@@ -59,12 +60,16 @@ def compute_token_accuracy_with_tolerance(target, pred, token, tolerance=1):
     return accuracy
 
 
-class TokenAccuracy:
+class TokenAccuracy(torchmetrics.Metric):
     """
     Computes Token Accuracy scores.
+    
+    This is a PyTorch Lightning compatible metric that accumulates token accuracy
+    scores across batches and computes the mean accuracy.
     """
 
     def __init__(self, token_name: str, token_id: int, tolerance: int = 1, verbose: bool = True):
+        super().__init__()
         self.token_name = token_name
         self.token_id = token_id
         self.tolerance = tolerance
@@ -72,17 +77,21 @@ class TokenAccuracy:
         self.scores = defaultdict(list)
 
     def reset(self):
-        return self
+        """Reset the metric state for a new epoch/validation phase."""
+        self.scores.clear()
 
     def update(self, name: str, refs: torch.Tensor, hyps: torch.Tensor) -> None:
         token_acc = compute_token_accuracy_with_tolerance(refs, hyps, token=self.token_id, tolerance=self.tolerance)
         self.scores[name].append(token_acc)
 
     def compute(self) -> dict[str, torch.Tensor]:
+        """Compute the mean token accuracy from accumulated scores."""
         corpus_metric = {}
         for name in self.scores.keys():
-            metric = torch.tensor(self.scores[name]).mean()
+            if self.scores[name]:
+                metric = torch.tensor(self.scores[name]).mean()
+            else:
+                metric = torch.tensor(0.0)
             corpus_metric[f"token_acc_{self.token_name}_{name}"] = metric
-        self.scores.clear()
         return corpus_metric
 

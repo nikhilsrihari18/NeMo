@@ -15,6 +15,7 @@ from collections import defaultdict
 
 import sacrebleu
 import torch
+import torchmetrics
 from whisper_normalizer.english import EnglishTextNormalizer
 
 from nemo.collections.asr.models import ASRModel
@@ -24,13 +25,17 @@ from nemo.collections.speechlm2.parts.pretrained import load_pretrained_nemo
 from nemo.utils import logging
 
 
-class ASRBLEU:
+class ASRBLEU(torchmetrics.Metric):
     """
     Computes BLEU scores on ASR predictions on generated audio with pretrained NeMo ASR.
     By default, uses Whisper's EnglishTextNormalizer on hypotheses and references.
+    
+    This is a PyTorch Lightning compatible metric that accumulates references
+    and ASR transcriptions across batches and computes corpus-level BLEU scores.
     """
 
     def __init__(self, pretrained_asr: str, normalize: bool = True, normalizer=None, verbose: bool = True) -> None:
+        super().__init__()
         self.asr = None  # load into memory on reset()
         self.pretrained_asr_name = pretrained_asr
         self.verbose = verbose
@@ -42,10 +47,17 @@ class ASRBLEU:
         else:
             self.normalizer = _identity
 
+        # Note: For text metrics that store lists of strings, we cannot use
+        # add_state() with tensor types. Instead, we manually manage state.
         self._refs = defaultdict(list)
         self._hyps = defaultdict(list)
 
     def reset(self):
+        """Reset the metric state and reload ASR model for a new epoch/validation phase."""
+        # Clear accumulated data
+        self._refs.clear()
+        self._hyps.clear()
+        
         # Cleaning up GPU memory before we load ASRModel, because it may already
         # be quite fragmented and close to the limit after observing many
         # dynamic shapes during the training epoch.
@@ -53,7 +65,6 @@ class ASRBLEU:
         with fp32_precision():  # Some NeMo ASR models weren't trained with bfloat16.
             self.asr = load_pretrained_nemo(ASRModel, self.pretrained_asr_name).eval()
         WithOptionalCudaGraphs.disable_cuda_graphs_recursive(self.asr, attribute_path="decoding.decoding")
-        return self
 
     def update(
         self, name: str, refs: list[str], pred_audio: torch.Tensor, pred_audio_lens: torch.Tensor = None
@@ -83,16 +94,21 @@ class ASRBLEU:
         return asr_hyps_texts
 
     def compute(self) -> dict[str, torch.Tensor]:
-        """Computes the final score and deallocates ASR and partial results."""
+        """Compute the corpus-level BLEU scores and deallocate ASR model to free GPU memory."""
         corpus_metric = {}
         for name in self._refs.keys():
             metric = torch.tensor(sacrebleu.corpus_bleu(self._hyps[name], [self._refs[name]]).score)
             corpus_metric[f"asr_bleu_{name}"] = metric
-        corpus_metric["asr_bleu"] = torch.stack(list(corpus_metric.values())).mean()
-        self._refs.clear()
-        self._hyps.clear()
-        self.asr = None  # free up GPU memory
+        
+        if corpus_metric:
+            corpus_metric["asr_bleu"] = torch.stack(list(corpus_metric.values())).mean()
+        else:
+            corpus_metric["asr_bleu"] = torch.tensor(0.0)
+        
+        # Free up GPU memory by deallocating the ASR model
+        self.asr = None
         torch.cuda.memory.empty_cache()
+        
         return corpus_metric
 
 

@@ -1542,21 +1542,44 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 "padding_ratio": num_frames / (B * T),
             }
             # Logging
-            self.log("batch_size", B, on_step=True, prog_bar=True, logger=True)
-            self.log("sequence_length", T, on_step=True, prog_bar=True, logger=True)
+            self.log("batch_size", B, on_step=False, on_epoch=True, prog_bar=False, logger=True)
+            self.log("sequence_length", T, on_step=False, on_epoch=True, prog_bar=False, logger=True)
             if self.cfg.get("do_user_asr", None):
-                self.log("agent_text_loss", agent_text_loss, on_step=True, prog_bar=True, logger=True)
-                self.log("user_text_loss", user_text_loss, on_step=True, prog_bar=True, logger=True)
-                self.log("user_eos_loss", user_eos_loss, on_step=True, prog_bar=True, logger=True)
-                self.log("user_bos_loss", user_bos_loss, on_step=True, prog_bar=True, logger=True)
-                self.log("agent_eos_loss", agent_eos_loss, on_step=True, prog_bar=True, logger=True)
-                self.log("agent_bos_loss", agent_bos_loss, on_step=True, prog_bar=True, logger=True)
+                self.log("agent_text_loss", agent_text_loss.detach(), on_step=False, on_epoch=True, prog_bar=False, logger=True)
+                self.log("user_text_loss", user_text_loss.detach(), on_step=False, on_epoch=True, prog_bar=False, logger=True)
+                self.log("user_eos_loss", user_eos_loss.detach(), on_step=False, on_epoch=True, prog_bar=False, logger=True)
+                self.log("user_bos_loss", user_bos_loss.detach(), on_step=False, on_epoch=True, prog_bar=False, logger=True)
+                self.log("agent_eos_loss", agent_eos_loss.detach(), on_step=False, on_epoch=True, prog_bar=False, logger=True)
+                self.log("agent_bos_loss", agent_bos_loss.detach(), on_step=False, on_epoch=True, prog_bar=False, logger=True)
 
             if not ignore_speech_gen and 'target_audio' in batch:
                 ans['audio_loss'] = audio_loss
             self.log_dict(ans, on_step=True)
 
             if self.cfg.get("log_train_metrics", None):  # Note: all these are optimistic because of teacher forcing
+                # Ensure training metrics exist (can be None after checkpoint load or missed init)
+                if not hasattr(self, 'train_bleu') or self.train_bleu is None:
+                    self.train_bleu = BLEU()
+                tolerance = int(self.cfg.get("val_acc_tolerance", 160) / (1000 / self.target_fps))
+                if not hasattr(self, 'train_text_bos_acc') or self.train_text_bos_acc is None:
+                    self.train_text_bos_acc = TokenAccuracy(
+                        token_name="text_bos", token_id=self.text_bos_id, tolerance=tolerance
+                    )
+                if not hasattr(self, 'train_text_eos_acc') or self.train_text_eos_acc is None:
+                    self.train_text_eos_acc = TokenAccuracy(
+                        token_name="text_eos", token_id=self.text_eos_id, tolerance=tolerance
+                    )
+                if self.cfg.get("do_user_asr", None):
+                    if not hasattr(self, 'user_bleu') or self.user_bleu is None:
+                        self.user_bleu = BLEU()
+                    if not hasattr(self, 'user_text_bos_acc') or self.user_text_bos_acc is None:
+                        self.user_text_bos_acc = TokenAccuracy(
+                            token_name="text_bos", token_id=self.text_bos_id, tolerance=tolerance
+                        )
+                    if not hasattr(self, 'user_text_eos_acc') or self.user_text_eos_acc is None:
+                        self.user_text_eos_acc = TokenAccuracy(
+                            token_name="text_eos", token_id=self.text_eos_id, tolerance=tolerance
+                        )
                 tok = self.tokenizer.tokenizer
                 user_ref_tokens = inputs["user_text_labels"]
                 if self.cfg.get("do_user_asr", None):
@@ -1599,10 +1622,10 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
 
                     ref_text = tokens_to_text(ref_tokens, tok)
                     pred_text = tokens_to_text(pred_tokens, tok)
-                    self.bleu.update(name='train', refs=ref_text, hyps=pred_text)
+                    self.train_bleu.update(name='train', refs=ref_text, hyps=pred_text)
 
-                    self.text_bos_acc.update(name='train', refs=inputs["text_labels"], hyps=pred_tokens)
-                    self.text_eos_acc.update(name='train', refs=inputs["text_labels"], hyps=pred_tokens)
+                    self.train_text_bos_acc.update(name='train', refs=inputs["text_labels"], hyps=pred_tokens)
+                    self.train_text_eos_acc.update(name='train', refs=inputs["text_labels"], hyps=pred_tokens)
 
                     if self.cfg.get("do_user_asr", None):
                         user_ref_text = tokens_to_text(user_ref_tokens, tok)
@@ -1623,72 +1646,123 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             self.speech_generation.setup_speaker_encoder()  # potentially reloads the speaker encoder to make sure it's in fp32
 
         if self.cfg.get("log_train_metrics", None):
-            self.bleu = BLEU().reset()
+            # Create metrics if they don't exist (first epoch only)
+            if not hasattr(self, 'train_bleu'):
+                self.train_bleu = BLEU()
+            
             if self.cfg.get("do_user_asr", None):
-                self.user_bleu = BLEU().reset()
+                if not hasattr(self, 'user_bleu'):
+                    self.user_bleu = BLEU()
 
             tolerance = int(
                 self.cfg.get("val_acc_tolerance", 160) / (1000 / self.target_fps)
             )  # 160 ms as default tolerance --> 2 tokens for 12.5FPS and 1 for 25FPS
-            self.text_bos_acc = TokenAccuracy(
-                token_name="text_bos", token_id=self.text_bos_id, tolerance=tolerance
-            ).reset()
-            self.text_eos_acc = TokenAccuracy(
-                token_name="text_eos", token_id=self.text_eos_id, tolerance=tolerance
-            ).reset()
+            
+            if not hasattr(self, 'train_text_bos_acc'):
+                self.train_text_bos_acc = TokenAccuracy(
+                    token_name="text_bos", token_id=self.text_bos_id, tolerance=tolerance
+                )
+            
+            if not hasattr(self, 'train_text_eos_acc'):
+                self.train_text_eos_acc = TokenAccuracy(
+                    token_name="text_eos", token_id=self.text_eos_id, tolerance=tolerance
+                )
 
             if self.cfg.get("do_user_asr", None):
-                self.user_text_bos_acc = TokenAccuracy(
-                    token_name="text_bos", token_id=self.text_bos_id, tolerance=tolerance
-                ).reset()
-                self.user_text_eos_acc = TokenAccuracy(
-                    token_name="text_eos", token_id=self.text_eos_id, tolerance=tolerance
-                ).reset()
+                if not hasattr(self, 'user_text_bos_acc'):
+                    self.user_text_bos_acc = TokenAccuracy(
+                        token_name="text_bos", token_id=self.text_bos_id, tolerance=tolerance
+                    )
+                
+                if not hasattr(self, 'user_text_eos_acc'):
+                    self.user_text_eos_acc = TokenAccuracy(
+                        token_name="text_eos", token_id=self.text_eos_id, tolerance=tolerance
+                    )
+
+    def _log_metric_dict(
+        self,
+        phase: str,
+        metric_label: str,
+        compute_fn: Callable[[], dict[str, torch.Tensor]],
+        name_prefix: str = "",
+    ) -> None:
+        metric_values = compute_fn()
+        for key, value in metric_values.items():
+            log_name = f"{name_prefix}{key}"
+            self.log(log_name, value.to(self.device))
 
     def on_train_epoch_end(self) -> None:
         if self.cfg.get("log_train_metrics", None):
-            bleu = self.bleu.compute()
-            for k, m in bleu.items():
-                self.log(f"{k}", m.to(self.device), on_epoch=True, sync_dist=True)
-
-            text_bos_acc = self.text_bos_acc.compute()
-            for k, m in text_bos_acc.items():
-                self.log(f"{k}", m.to(self.device), on_epoch=True, sync_dist=True)
-
-            text_eos_acc = self.text_eos_acc.compute()
-            for k, m in text_eos_acc.items():
-                self.log(f"{k}", m.to(self.device), on_epoch=True, sync_dist=True)
+            self._log_metric_dict("train", "bleu", self.train_bleu.compute)
+            self._log_metric_dict("train", "text_bos_acc", self.train_text_bos_acc.compute)
+            self._log_metric_dict("train", "text_eos_acc", self.train_text_eos_acc.compute)
+            
+            # Reset after computing and logging
+            self.train_bleu.reset()
+            self.train_text_bos_acc.reset()
+            self.train_text_eos_acc.reset()
 
             if self.cfg.get("do_user_asr", None):
-                user_bleu = self.user_bleu.compute()
-                for k, m in user_bleu.items():
-                    self.log(f"user_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
-
-                user_text_bos_acc = self.user_text_bos_acc.compute()
-                for k, m in user_text_bos_acc.items():
-                    self.log(f"user_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
-
-                user_text_eos_acc = self.user_text_eos_acc.compute()
-                for k, m in user_text_eos_acc.items():
-                    self.log(f"user_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
+                self._log_metric_dict("train", "user_bleu", self.user_bleu.compute, name_prefix="user_")
+                self._log_metric_dict(
+                    "train",
+                    "user_text_bos_acc",
+                    self.user_text_bos_acc.compute,
+                    name_prefix="user_",
+                )
+                self._log_metric_dict(
+                    "train",
+                    "user_text_eos_acc",
+                    self.user_text_eos_acc.compute,
+                    name_prefix="user_",
+                )
+                
+                # Reset after computing and logging
+                self.user_bleu.reset()
+                self.user_text_bos_acc.reset()
+                self.user_text_eos_acc.reset()
 
     def on_validation_epoch_start(self) -> None:
-        self.on_train_epoch_start()
-        self.results_logger = ResultsLogger(self.validation_save_path).reset()
+        # Note: we intentionally DO NOT call `self.on_train_epoch_start()` here anymore.
+        # The validation hook used to reuse the same train metrics and would reset them,
+        # which caused the training accumulators to be empty by the time
+        # `on_train_epoch_end()` logged them. Instead, duplicate the minimal setup logic.
+        # setup_audio_codec(self)  # may not be needed for validation; revisit if codec state causes issues
+        # [TO DO] check if this is needed
+        # if (
+        #     not self.cfg.get("ignore_speech_gen", None) and
+        #     hasattr(self.speech_generation, "use_speaker_encoder") and
+        #     self.speech_generation.use_speaker_encoder
+        # ):
+        #     self.speech_generation.setup_speaker_encoder()  # potentially reloads the speaker encoder to make sure it's in fp32
+        
+        # Create ResultsLogger if needed
+        if not hasattr(self, 'results_logger'):
+            self.results_logger = ResultsLogger(self.validation_save_path)
 
+        # Create ASRBLEU if needed
         if not self.cfg.get("ignore_speech_gen", None):
-            self.asr_bleu = ASRBLEU(self.cfg.scoring_asr).reset()
+            if not hasattr(self, 'asr_bleu'):
+                self.asr_bleu = ASRBLEU(self.cfg.scoring_asr)
 
-        self.bleu = BLEU().reset()
+        # Create validation BLEU if needed
+        if not hasattr(self, 'val_bleu'):
+            self.val_bleu = BLEU()
+        
         tolerance = int(
             self.cfg.get("val_acc_tolerance", 160) / (1000 / self.target_fps)
         )  # 160 ms as default tolerance --> 2 tokens for 12.5FPS and 1 for 25FPS
-        self.text_bos_acc = TokenAccuracy(
-            token_name="text_bos", token_id=self.text_bos_id, tolerance=tolerance
-        ).reset()
-        self.text_eos_acc = TokenAccuracy(
-            token_name="text_eos", token_id=self.text_eos_id, tolerance=tolerance
-        ).reset()
+        
+        # Create validation token accuracy metrics if needed
+        if not hasattr(self, 'val_text_bos_acc'):
+            self.val_text_bos_acc = TokenAccuracy(
+                token_name="text_bos", token_id=self.text_bos_id, tolerance=tolerance
+            )
+        
+        if not hasattr(self, 'val_text_eos_acc'):
+            self.val_text_eos_acc = TokenAccuracy(
+                token_name="text_eos", token_id=self.text_eos_id, tolerance=tolerance
+            )
 
     def save_validation_results_as_json(self, prefix="val"):
         """
@@ -1759,20 +1833,32 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
 
     def on_validation_epoch_end(self, prefix="val") -> None:
         if not self.cfg.get("ignore_speech_gen", None):
-            asr_bleu = self.asr_bleu.compute()
-            for k, m in asr_bleu.items():
-                self.log(f"{prefix}_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
-        bleu = self.bleu.compute()
-        for k, m in bleu.items():
-            self.log(f"{prefix}_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
-        text_bos_acc = self.text_bos_acc.compute()
-        for k, m in text_bos_acc.items():
-            self.log(f"{prefix}_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
-        text_eos_acc = self.text_eos_acc.compute()
-        for k, m in text_eos_acc.items():
-            self.log(f"{prefix}_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
+            self._log_metric_dict(prefix, "asr_bleu", self.asr_bleu.compute, name_prefix=f"{prefix}_")
+        self._log_metric_dict(prefix, "bleu", self.val_bleu.compute, name_prefix=f"{prefix}_")
+        self._log_metric_dict(
+            prefix,
+            "text_bos_acc",
+            self.val_text_bos_acc.compute,
+            name_prefix=f"{prefix}_",
+        )
+        self._log_metric_dict(
+            prefix,
+            "text_eos_acc",
+            self.val_text_eos_acc.compute,
+            name_prefix=f"{prefix}_",
+        )
 
         self.save_validation_results_as_json(prefix=prefix)  
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        
+        # Reset after computing and logging
+        if not self.cfg.get("ignore_speech_gen", None):
+            self.asr_bleu.reset()
+        self.val_bleu.reset()
+        self.val_text_bos_acc.reset()
+        self.val_text_eos_acc.reset()
+        self.results_logger.reset()
 
     def transcribe_audio(self, audio, audio_lens):
         if audio_lens is None:
@@ -1860,10 +1946,20 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                     result_entry['sys_prompt'] = dataset_batch['instructions_raw_text'][i]
                     result_entry['call_response'] = dataset_batch['call_responses_raw_text'][i]
                 self.validation_results[name].append(result_entry)
+            # import pdb; pdb.set_trace()
+            logging.info(f"dataset_batch['target_texts']: {dataset_batch['target_texts']}")
+            logging.info(f"results['text']: {results['text']}")
+            logging.info(f"name: {name}")
 
-            self.bleu.update(name=name, refs=dataset_batch["target_texts"], hyps=results["text"])
-            self.text_bos_acc.update(name=name, refs=dataset_batch["target_tokens"], hyps=results["tokens_text"])
-            self.text_eos_acc.update(name=name, refs=dataset_batch["target_tokens"], hyps=results["tokens_text"])
+            self.val_bleu.update(name=name, refs=dataset_batch["target_texts"], hyps=results["text"])
+            logging.info(f"self.val_bleu._refs: {self.val_bleu._refs}")
+            logging.info(f"self.val_bleu._hyps: {self.val_bleu._hyps}")
+            logging.info(f"self.dataset_batch['target_tokens']: {dataset_batch["target_tokens"]}")
+            logging.info(f"results['tokens_text']: {results["tokens_text"]}")
+            self.val_text_bos_acc.update(name=name, refs=dataset_batch["target_tokens"], hyps=results["tokens_text"])
+            logging.info(f"self.dataset_batch['target_tokens']: {dataset_batch["target_tokens"]}")
+            logging.info(f"results['tokens_text']: {results["tokens_text"]}")
+            self.val_text_eos_acc.update(name=name, refs=dataset_batch["target_tokens"], hyps=results["tokens_text"])
 
     def on_test_epoch_start(self) -> None:
         return self.on_validation_epoch_start()
@@ -2147,7 +2243,8 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 gen_audio = gen_audio[:, :T_local]
 
         ans = {
-            "text": tokens_to_str(gen_text, lengths, tokenizer=self.tokenizer, pad_id=self.text_pad_id),
+            "text_with_special_tokens": tokens_to_str(gen_text, lengths, tokenizer=self.tokenizer, pad_id=self.text_pad_id),
+            "text": tokens_to_text(gen_text, tokenizer=self.tokenizer.tokenizer, text_only=True),
             "tokens_text": gen_text,
             "tokens_audio": gen_audio,
             "tokens_len": lengths,
