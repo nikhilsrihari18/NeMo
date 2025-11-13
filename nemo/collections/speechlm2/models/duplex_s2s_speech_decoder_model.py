@@ -1631,7 +1631,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 self.cfg.get("val_acc_tolerance", 160) / (1000 / self.target_fps)
             )  # 160 ms as default tolerance --> 2 tokens for 12.5FPS and 1 for 25FPS
             self.text_bos_acc = TokenAccuracy(
-                token_name="text_bos", token_id=self.text_bos_id, tolerance=tolerance
+                token_name="text_bos", token_id=self.assistant_start_ids[0], tolerance=tolerance
             ).reset()
             self.text_eos_acc = TokenAccuracy(
                 token_name="text_eos", token_id=self.text_eos_id, tolerance=tolerance
@@ -1639,7 +1639,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
 
             if self.cfg.get("do_user_asr", None):
                 self.user_text_bos_acc = TokenAccuracy(
-                    token_name="text_bos", token_id=self.text_bos_id, tolerance=tolerance
+                    token_name="text_bos", token_id=self.user_start_ids[0], tolerance=tolerance
                 ).reset()
                 self.user_text_eos_acc = TokenAccuracy(
                     token_name="text_eos", token_id=self.text_eos_id, tolerance=tolerance
@@ -1673,6 +1673,12 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                     self.log(f"user_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
 
     def on_validation_epoch_start(self) -> None:
+        # r = dist.get_rank() if dist.is_initialized() else -1
+        # print(f"[DEBUG] entered train_step on rank={r}, LOCAL_RANK={os.environ.get('LOCAL_RANK')}")
+        # if r == 0:
+        #     import debugpy
+        #     debugpy.breakpoint()
+        
         self.on_train_epoch_start()
         self.results_logger = ResultsLogger(self.validation_save_path).reset()
 
@@ -1684,7 +1690,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             self.cfg.get("val_acc_tolerance", 160) / (1000 / self.target_fps)
         )  # 160 ms as default tolerance --> 2 tokens for 12.5FPS and 1 for 25FPS
         self.text_bos_acc = TokenAccuracy(
-            token_name="text_bos", token_id=self.text_bos_id, tolerance=tolerance
+            token_name="text_bos", token_id=self.assistant_start_ids[0], tolerance=tolerance
         ).reset()
         self.text_eos_acc = TokenAccuracy(
             token_name="text_eos", token_id=self.text_eos_id, tolerance=tolerance
@@ -1773,6 +1779,9 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             self.log(f"{prefix}_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
 
         self.save_validation_results_as_json(prefix=prefix)  
+        
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
 
     def transcribe_audio(self, audio, audio_lens):
         if audio_lens is None:
@@ -1995,7 +2004,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         # -- First step, use init tokens  -------
         if self.system_prompt is not None or self.use_chat_template:
             init_seq = self._get_bos_embedding()
-            input_embeds[:, :init_seq.shape[0]] = init_seq
+            input_embeds[:, :init_seq.shape[0], :] = init_seq
         else:
             # input_embeds[:, 0] += self._get_bos_embedding()
             input_embeds[:, 0] = self._get_bos_embedding()  # Note: overwriting instead of adding in orig solution
@@ -2028,7 +2037,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
 
         step_asr_emb = None if asr_emb is None else asr_emb[:, :1]
         ans = self(
-            input_embeds[:, :1],
+            input_embeds[:, :1, :],
             cache=cache,
             input_audio_tokens=first_audio,
             seq_mask=None,
