@@ -1660,7 +1660,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             
             if not hasattr(self, 'train_text_bos_acc'):
                 self.train_text_bos_acc = TokenAccuracy(
-                    token_name="text_bos", token_id=self.text_bos_id, tolerance=tolerance
+                    token_name="text_bos", token_id=self.assistant_start_ids[0], tolerance=tolerance
                 )
             
             if not hasattr(self, 'train_text_eos_acc'):
@@ -1671,7 +1671,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             if self.cfg.get("do_user_asr", None):
                 if not hasattr(self, 'user_text_bos_acc'):
                     self.user_text_bos_acc = TokenAccuracy(
-                        token_name="text_bos", token_id=self.text_bos_id, tolerance=tolerance
+                        token_name="text_bos", token_id=self.user_start_ids[0], tolerance=tolerance
                     )
                 
                 if not hasattr(self, 'user_text_eos_acc'):
@@ -1756,7 +1756,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         # Create validation token accuracy metrics if needed
         if not hasattr(self, 'val_text_bos_acc'):
             self.val_text_bos_acc = TokenAccuracy(
-                token_name="text_bos", token_id=self.text_bos_id, tolerance=tolerance
+                token_name="text_bos", token_id=self.assistant_start_ids[0], tolerance=tolerance
             )
         
         if not hasattr(self, 'val_text_eos_acc'):
@@ -2049,7 +2049,8 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             source_encoded, lengths, asr_emb = self.perception(
                 input_signal=input_signal, input_signal_length=input_signal_lens, return_encoder_emb=True
             )
-        B, T_local, H = source_encoded.shape
+        B, T_local, H = source_encoded.shape 
+        T_local = torch.floor(T_local * self.cfg.get("inference_extra_decoding_length_factor", 1)).int()
 
         # Determine decoding length and pad if FSDP
         print("self._use_fsdp", self._use_fsdp)
@@ -2094,7 +2095,6 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             cache = None
             print(f"Cache disabled, so no cache class was initialized")
         
-        # Call reset_input_and_kv_cache to enable cache for TransformerARSpeechDecoder
         do_user_asr = self.cfg.get("do_user_asr", None)
 
         if not ignore_speech_gen:
@@ -2162,10 +2162,17 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             asr_emb_slice = None
 
         # -- Autoregressive loop ----------
+        is_user_silent = torch.zeros(B, device=self.device, dtype=torch.bool)
         for t in range(1, T):
             last_emb = self.embed_tokens(gen_text[:, t - 1])
             if self.cfg.get("skip_agent_pad_input", None):
                 agent_padding_pos = gen_text[:, t - 1].eq(self.text_pad_id)
+                if True:
+                    agent_padding_pos = (
+                        agent_padding_pos |    
+                        gen_text[:, t - 1].eq(self.word_pad_id[0]) | 
+                        gen_text[:, t - 1].eq(self.word_epad_id[0]) 
+                    ) 
                 if input_text is not None:
                     user_padding_pos = input_text.eq(self.text_pad_id)
                     padding_pos = user_padding_pos & ~agent_padding_pos
@@ -2210,9 +2217,24 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 speaker_encoder_emb=None,  # for inference uses the cached inference_speaker_embedding
                 llm_kwargs=llm_kwargs,
             )
+            
+            # Agent text inference
             gen_text[:, t] = ans["text_logits"][:, -1].argmax(dim=-1)
+                
+            # User text inference
             if do_user_asr and "user_text_logits" in ans:
-                user_gen_text[:, t] = ans["user_text_logits"][:, -1].argmax(dim=-1)
+                user_dec = ans["user_text_logits"][:, -1].argmax(dim=-1)
+                # Inference trick: silence user output after eos
+                user_gen_text[:, t] = torch.where(
+                    is_user_silent,
+                    self.text_pad_id,
+                    user_dec
+                ) # type: ignore
+
+                is_user_silent[user_dec == self.text_eos_id] = True
+                is_user_silent[user_dec == self.user_start_ids[0]] = False
+             
+            # Agent audio inference
             if not ignore_speech_gen:
                 gen_audio[:, t] = ans["audio_logits"][:, -1].argmax(dim=-1)
 
@@ -2256,6 +2278,9 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                         gen_audio[:, t],
                     )
 
+            if self.cfg.get("stop_inference_on_eos", None) and all(gen_text[:, t] == self.text_eos_id):
+                break
+       
         # Trim back to local length if padded
         if self._use_fsdp and T > T_local:
             gen_text = gen_text[:, :T_local]
