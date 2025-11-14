@@ -58,7 +58,7 @@ class BLEU(torchmetrics.Metric):
             self._hyps[name].append(self.normalizer(hyp))
             if self.verbose:
                 asrb = sacrebleu.sentence_bleu(hyp, [ref]).score
-                logging.info(f"[REF]\t{ref}\n[HYP]\t{hyp} [{asrb:.2f}]")
+                logging.info(f"\n\n[REF]\t{ref}\n[HYP]\t{hyp} [{asrb:.2f}]")
 
     def compute(self) -> dict[str, torch.Tensor]:
         """Compute the corpus-level BLEU scores from accumulated data."""

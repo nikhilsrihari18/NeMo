@@ -2063,16 +2063,19 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             T_tensor = torch.tensor([T_local], device=source_encoded.device)
             dist.all_reduce(T_tensor, op=dist.ReduceOp.MAX)
             T = int(T_tensor.item())
-            if T > T_local:
-                last_frame_source = source_encoded[:, T_local - 1 : T_local, :]
-                pad_source = last_frame_source.repeat(1, T - T_local, 1)
-                source_encoded = torch.cat([source_encoded, pad_source], dim=1)
-                last_frame_asr = asr_emb[:, T_local - 1 : T_local, :]
-                pad_asr = last_frame_asr.repeat(1, T - T_local, 1)
-                asr_emb = torch.cat([asr_emb, pad_asr], dim=1)
         else:
             T = T_local
 
+        # Pad if needed (not jsut for FSDP, also potentially for extra decoding length)
+        T_ = source_encoded.shape[1]
+        if T > T_:
+            last_frame_source = source_encoded[:, T_ - 1 : T_, :]
+            pad_source = last_frame_source.repeat(1, T - T_, 1)
+            source_encoded = torch.cat([source_encoded, pad_source], dim=1)
+            last_frame_asr = asr_emb[:, T_ - 1 : T_, :]
+            pad_asr = last_frame_asr.repeat(1, T - T_, 1)
+            asr_emb = torch.cat([asr_emb, pad_asr], dim=1)
+        
         # Apply channel weight
         input_embeds = source_encoded.clone()
         input_embeds *= self.cfg.get("duplex_user_channel_weight", 1.0)
@@ -2283,8 +2286,9 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                         gen_audio[:, t],
                     )
 
-            if self.cfg.get("stop_inference_on_eos", None) and all(gen_text[:, t] == self.text_eos_id):
-                break
+            # if self.cfg.get("stop_inference_on_eos", None) and all(gen_text[:, t] == self.text_eos_id):  
+            # # wrong needs to be eos seen on or before then out of the loop trim excess after eos
+            #     break
        
         # Trim back to local length if padded
         if self._use_fsdp and T > T_local:
@@ -2861,7 +2865,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             fill_value=self.speech_delay_id,
             device=self.device,
             dtype=torch.long,
-        )
+        ) # type: ignore
         
         # If llm_use_cache is disabled, pass entire sequences up to current timestep
         if not llm_use_cache:

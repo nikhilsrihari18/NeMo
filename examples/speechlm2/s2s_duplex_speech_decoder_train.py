@@ -77,6 +77,8 @@ def init_from_model_from_train_ckpt(ckpt_path, model, selected_modules=None):
     model.load_state_dict(state_map, strict=True)
 
     return model
+
+
 @hydra_runner(config_path="conf", config_name="s2s_duplex_speech_decoder")
 def train(cfg):
     OmegaConf.resolve(cfg)
@@ -138,6 +140,8 @@ def train(cfg):
     # maybe_wait_for_debugger()
 
     trainer.fit(model, datamodule)
+    
+    # trainer.validate(model, datamodule)
    
 if __name__ == "__main__":
     train()
