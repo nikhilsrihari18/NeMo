@@ -18,6 +18,7 @@ import json
 import os
 import random
 import tempfile
+from pathlib import Path
 from collections import defaultdict
 from typing import Callable, Iterable, Optional, Tuple, List
 
@@ -318,13 +319,21 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 z_dim = 128  # TODO: add to config and test larger values
                 # z_dim = 512
             )
-
             
-        # Add word padding tokens and prepare to learn new embeddings just for them: TODO: DEL NOT NEEDED ANYMORE, USING EXISTING SPECIAL TOKENS
-        # if self.cfg.get("tokenizer.use_word_pad", None):
-        #     add_word_pad_token_embeddings(self, cfg.get("tokenizer.train_new_embed_only", None))
-
-        maybe_install_lora(self)
+        # r = dist.get_rank() if dist.is_initialized() else -1
+        # print(f"[DEBUG] entered train_step on rank={r}, LOCAL_RANK={os.environ.get('LOCAL_RANK')}")
+        # if r == 0:
+        #     import debugpy
+        #     debugpy.breakpoint()
+            
+        if self.cfg.get("lora_init_merge", False): 
+            if (Path(cfg.exp_manager.explicit_log_dir) / 'checkpoints').exists():
+                logging.info("Intermediate checkpoints found in exp dir. We won't restore LORA config (previously merged)...") 
+                resuming = True
+            else:
+                resuming = False
+        
+        maybe_install_lora(self, lora_init_merge=self.cfg.get("lora_init_merge", False), resuming=resuming)
 
         # Load the pretrained streaming ASR model and copy its parameters into the audio perception module.
         setup_speech_encoder(self)
@@ -1949,7 +1958,8 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             source_encoded, lengths, asr_emb = self.perception(
                 input_signal=input_signal, input_signal_length=input_signal_lens, return_encoder_emb=True
             )
-        B, T_local, H = source_encoded.shape
+        B, T_local, H = source_encoded.shape 
+        T_local = int(T_local * self.cfg.get("inference_extra_decoding_length_factor", 1))
 
         # Determine decoding length and pad if FSDP
         print("self._use_fsdp", self._use_fsdp)
@@ -1957,16 +1967,19 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             T_tensor = torch.tensor([T_local], device=source_encoded.device)
             dist.all_reduce(T_tensor, op=dist.ReduceOp.MAX)
             T = int(T_tensor.item())
-            if T > T_local:
-                last_frame_source = source_encoded[:, T_local - 1 : T_local, :]
-                pad_source = last_frame_source.repeat(1, T - T_local, 1)
-                source_encoded = torch.cat([source_encoded, pad_source], dim=1)
-                last_frame_asr = asr_emb[:, T_local - 1 : T_local, :]
-                pad_asr = last_frame_asr.repeat(1, T - T_local, 1)
-                asr_emb = torch.cat([asr_emb, pad_asr], dim=1)
         else:
             T = T_local
 
+        # Pad if needed (not jsut for FSDP, also potentially for extra decoding length)
+        T_ = source_encoded.shape[1]
+        if T > T_:
+            last_frame_source = source_encoded[:, T_ - 1 : T_, :]
+            pad_source = last_frame_source.repeat(1, T - T_, 1)
+            source_encoded = torch.cat([source_encoded, pad_source], dim=1)
+            last_frame_asr = asr_emb[:, T_ - 1 : T_, :]
+            pad_asr = last_frame_asr.repeat(1, T - T_, 1)
+            asr_emb = torch.cat([asr_emb, pad_asr], dim=1)
+        
         # Apply channel weight
         input_embeds = source_encoded.clone()
         input_embeds *= self.cfg.get("duplex_user_channel_weight", 1.0)
@@ -1994,12 +2007,14 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             cache = None
             print(f"Cache disabled, so no cache class was initialized")
         
-        # Call reset_input_and_kv_cache to enable cache for TransformerARSpeechDecoder
+        do_user_asr = self.cfg.get("do_user_asr", None)
+
         if not ignore_speech_gen:
             self.speech_generation.reset_input_and_kv_cache(use_cache=True)
-            gen_audio = torch.empty(B, T, self._num_codebooks, device=self.device, dtype=torch.long)
+            gen_audio = torch.zeros(B, T, self._num_codebooks, device=self.device, dtype=torch.long)
 
-        gen_text = torch.empty(B, T, device=self.device, dtype=torch.long)
+        gen_text = torch.zeros(B, T, device=self.device, dtype=torch.long)
+        user_gen_text = torch.zeros(B, T, device=self.device, dtype=torch.long) if do_user_asr else None
 
         # -- First step, use init tokens  -------
         if self.system_prompt is not None or self.use_chat_template:
@@ -2048,6 +2063,8 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         )
 
         gen_text[:, 0] = ans["text_logits"][:, -1].argmax(dim=-1)
+        if do_user_asr and "user_text_logits" in ans:
+            user_gen_text[:, 0] = ans["user_text_logits"][:, -1].argmax(dim=-1)
         if not ignore_speech_gen:
             gen_audio[:, 0] = ans["audio_logits"][:, -1].argmax(dim=-1)
 
@@ -2057,10 +2074,17 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             asr_emb_slice = None
 
         # -- Autoregressive loop ----------
+        is_user_silent = torch.zeros(B, device=self.device, dtype=torch.bool)
         for t in range(1, T):
             last_emb = self.embed_tokens(gen_text[:, t - 1])
             if self.cfg.get("skip_agent_pad_input", None):
                 agent_padding_pos = gen_text[:, t - 1].eq(self.text_pad_id)
+                if True:
+                    agent_padding_pos = (
+                        agent_padding_pos |    
+                        gen_text[:, t - 1].eq(self.word_pad_id[0]) | 
+                        gen_text[:, t - 1].eq(self.word_epad_id[0]) 
+                    ) 
                 if input_text is not None:
                     user_padding_pos = input_text.eq(self.text_pad_id)
                     padding_pos = user_padding_pos & ~agent_padding_pos
@@ -2105,7 +2129,24 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 speaker_encoder_emb=None,  # for inference uses the cached inference_speaker_embedding
                 llm_kwargs=llm_kwargs,
             )
+            
+            # Agent text inference
             gen_text[:, t] = ans["text_logits"][:, -1].argmax(dim=-1)
+                
+            # User text inference
+            if do_user_asr and "user_text_logits" in ans:
+                user_dec = ans["user_text_logits"][:, -1].argmax(dim=-1)
+                # Inference trick: silence user output after eos
+                user_gen_text[:, t] = torch.where(
+                    is_user_silent,
+                    self.text_pad_id,
+                    user_dec
+                ) # type: ignore
+
+                is_user_silent[user_dec == self.text_eos_id] = True
+                is_user_silent[user_dec == self.user_start_ids[0]] = False
+             
+            # Agent audio inference
             if not ignore_speech_gen:
                 gen_audio[:, t] = ans["audio_logits"][:, -1].argmax(dim=-1)
 
@@ -2149,18 +2190,35 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                         gen_audio[:, t],
                     )
 
+            if self.cfg.get("stop_inference_on_eos", None) and all(gen_text[:, t] == self.text_eos_id):
+                break
+       
         # Trim back to local length if padded
         if self._use_fsdp and T > T_local:
             gen_text = gen_text[:, :T_local]
             if not ignore_speech_gen:
                 gen_audio = gen_audio[:, :T_local]
+            if do_user_asr:
+                user_gen_text = user_gen_text[:, :T_local]
+
+        if do_user_asr:
+            user_text = tokens_to_text(
+                user_gen_text, tokenizer=self.tokenizer.tokenizer, text_only=True
+            )
+            user_text_with_special = tokens_to_str(
+                user_gen_text, lengths, tokenizer=self.tokenizer, pad_id=self.text_pad_id
+            )
 
         ans = {
-            "text": tokens_to_str(gen_text, lengths, tokenizer=self.tokenizer, pad_id=self.text_pad_id),
+            "text_with_special_tokens": tokens_to_str(gen_text, lengths, tokenizer=self.tokenizer, pad_id=self.text_pad_id),
+            "text": tokens_to_text(gen_text, tokenizer=self.tokenizer.tokenizer, text_only=True),
             "tokens_text": gen_text,
             "tokens_audio": gen_audio,
             "tokens_len": lengths,
         }
+        if do_user_asr:
+            ans["user_text_with_special_tokens"] = user_text_with_special
+            ans["user_text"] = user_text
 
         ans["audio"] = ans["audio_len"] = None
         if not ignore_speech_gen:
@@ -2698,8 +2756,10 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             cache = None
         # Call reset_input_and_kv_cache to enable cache for TransformerARSpeechDecoder
         self.speech_generation.reset_input_and_kv_cache(use_cache=True)
+        do_user_asr = self.cfg.get("do_user_asr", None)
         gen_text = torch.empty(B, T, device=self.device, dtype=torch.long)
         gen_audio = torch.empty(B, T, self._num_codebooks, device=self.device, dtype=torch.long)
+        user_gen_text = torch.empty(B, T, device=self.device, dtype=torch.long) if do_user_asr else None
 
         # First step, use speech_delay token
         input_embeds[:, 0] += self._get_bos_embedding()
@@ -2708,7 +2768,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             fill_value=self.speech_delay_id,
             device=self.device,
             dtype=torch.long,
-        )
+        ) # type: ignore
         
         # If llm_use_cache is disabled, pass entire sequences up to current timestep
         if not llm_use_cache:
@@ -2723,6 +2783,8 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             loss_mask=None
         )
         gen_text[:, 0] = ans["text_logits"][:, -1].argmax(dim=-1)
+        if do_user_asr and "user_text_logits" in ans:
+            user_gen_text[:, 0] = ans["user_text_logits"][:, -1].argmax(dim=-1)
         gen_audio[:, 0] = ans["audio_logits"][:, -1].argmax(dim=-1)
 
         # Autoregressive loop
@@ -2736,6 +2798,8 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 input_audio_tokens=current_audio
             )
             gen_text[:, t] = ans["text_logits"][:, -1].argmax(dim=-1)
+            if do_user_asr and "user_text_logits" in ans:
+                user_gen_text[:, t] = ans["user_text_logits"][:, -1].argmax(dim=-1)
             gen_audio[:, t] = ans["audio_logits"][:, -1].argmax(dim=-1)
 
         # remove parts corresponding to system prompt
@@ -2743,11 +2807,23 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
 
         gen_text = gen_text[:, sys_prompt_batch_len:]
         gen_audio = gen_audio[:, sys_prompt_batch_len:]
+        if do_user_asr:
+            user_gen_text = user_gen_text[:, sys_prompt_batch_len:]
 
         # Trim back to local length if padded
         if self._use_fsdp and T > T_local:
             gen_text = gen_text[:, :T_local]
             gen_audio = gen_audio[:, :T_local]
+            if do_user_asr:
+                user_gen_text = user_gen_text[:, :T_local]
+
+        if do_user_asr:
+            user_text = tokens_to_text(
+                user_gen_text, tokenizer=self.tokenizer.tokenizer, text_only=True
+            )
+            user_text_with_special = tokens_to_str(
+                user_gen_text, lengths, tokenizer=self.tokenizer, pad_id=self.text_pad_id
+            )
 
         ans = {
             "text": tokens_to_str(gen_text, lengths, tokenizer=self.tokenizer, pad_id=self.text_pad_id),
@@ -2755,6 +2831,9 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             "tokens_audio": gen_audio,
             "tokens_len": lengths,
         }
+        if do_user_asr:
+            ans["user_text_with_special_tokens"] = user_text_with_special
+            ans["user_text"] = user_text
 
         if decode_audio:
             gen_audio_codes = replace_control_speech_codes(gen_audio, self._control_codes)
