@@ -14,6 +14,7 @@
 import os
 from pathlib import Path
 import torch
+import torch.distributed as dist
 from lightning.pytorch import Trainer
 from omegaconf import OmegaConf
 
@@ -29,6 +30,23 @@ from nemo.utils import logging
 
 
 torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+
+
+def maybe_wait_for_debugger(port_base=5678):
+    try:
+        import debugpy
+    except ImportError:
+        return
+    is_ddp = dist.is_available() and dist.is_initialized()
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    # Debug only rank 0 (or set to local_rank for all local ranks)
+    if (not is_ddp) or dist.get_rank() == 0:
+        port = port_base
+        debugpy.listen(("0.0.0.0", port))
+        print(f"[debug] Listening for debugger on port {port} (rank 0).")
+        debugpy.wait_for_client()
+        debugpy.breakpoint()
+
 
 def dcp_dir_to_state_dict(meta, top_key, reader):
     state_map = {}
@@ -59,6 +77,7 @@ def init_from_model_from_train_ckpt(ckpt_path, model, selected_modules=None):
     model.load_state_dict(state_map, strict=True)
 
     return model
+
 @hydra_runner(config_path="conf", config_name="s2s_duplex_speech_decoder")
 def train(cfg):
     OmegaConf.resolve(cfg)
@@ -70,6 +89,8 @@ def train(cfg):
     OmegaConf.save(cfg, log_dir / "exp_config.yaml")
 
     with trainer.init_module():
+        # maybe_wait_for_debugger()
+        
         model = DuplexS2SSpeechDecoderModel(OmegaConf.to_container(cfg, resolve=True))
         
         if cfg.model.get("pretrained_s2s_train_ckpt", None):
@@ -116,8 +137,12 @@ def train(cfg):
         skip_agent_word_padding=skip_agent_word_padding
     )
     datamodule = DataModule(cfg.data, tokenizer=model.tokenizer, dataset=dataset)
+    
+    # maybe_wait_for_debugger()
 
     trainer.fit(model, datamodule)
+    
+    # trainer.validate(model, datamodule)
    
 if __name__ == "__main__":
     train()
