@@ -18,6 +18,7 @@ import json
 import os
 import random
 import tempfile
+from pathlib import Path
 from collections import defaultdict
 from typing import Callable, Iterable, Optional, Tuple, List
 
@@ -318,11 +319,12 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 z_dim = 128  # TODO: add to config and test larger values
                 # z_dim = 512
             )
-
             
-        # Add word padding tokens and prepare to learn new embeddings just for them: TODO: DEL NOT NEEDED ANYMORE, USING EXISTING SPECIAL TOKENS
-        # if self.cfg.get("tokenizer.use_word_pad", None):
-        #     add_word_pad_token_embeddings(self, cfg.get("tokenizer.train_new_embed_only", None))
+        # r = dist.get_rank() if dist.is_initialized() else -1
+        # print(f"[DEBUG] entered train_step on rank={r}, LOCAL_RANK={os.environ.get('LOCAL_RANK')}")
+        # if r == 0:
+        #     import debugpy
+        #     debugpy.breakpoint()
 
         maybe_install_lora(self)
 
@@ -1308,7 +1310,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
 
         for m in (
             self.perception.preprocessor, self.perception.encoder,
-            self.llm, self.lm_head, self.embed_tokens
+            self.llm, self.lm_head, self.embed_tokens, self.agent_film
         ):
             if self.cfg.get(
                 "tokenizer", None
@@ -1873,11 +1875,6 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         return hyps
 
     def validation_step(self, batch: dict, batch_idx: int):
-
-        r = dist.get_rank() if dist.is_initialized() else -1
-        print(f"[DEBUG] entered train_step on rank={r}, LOCAL_RANK={os.environ.get('LOCAL_RANK')}")
-        import debugpy
-        debugpy.breakpoint()
 
         # Update speaker embedding to reflect the one in the prompt during inference
         if (

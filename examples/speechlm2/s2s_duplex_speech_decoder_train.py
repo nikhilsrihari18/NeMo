@@ -20,7 +20,6 @@ from omegaconf import OmegaConf
 
 import torch.distributed.checkpoint as dcp
 from torch.distributed.checkpoint import load_state_dict
-from collections import OrderedDict
 
 from nemo.collections.speechlm2 import DataModule, DuplexS2SDataset, DuplexS2SSpeechDecoderModel
 from nemo.core.config import hydra_runner
@@ -63,13 +62,11 @@ def dcp_dir_to_state_dict(meta, top_key, reader):
     return {k.replace('state_dict.', ''): v.detach().cpu().clone() for k, v in state_map.items()}
 
 
-def init_from_model_from_train_ckpt(ckpt_path, model, selected_modules=None): 
+def init_from_model_from_train_ckpt(ckpt_path, meta, reader, model, selected_modules=None): 
     
     logging.info("Restoring training ckpt from %s..." % ckpt_path)   
 
     state_map = {}
-    reader = dcp.FileSystemReader(ckpt_path)
-    meta = reader.read_metadata()
     for module in selected_modules:
         state_map.update(
             dcp_dir_to_state_dict(meta, f"state_dict.{module}", reader)
@@ -90,17 +87,56 @@ def train(cfg):
     OmegaConf.save(cfg, log_dir / "exp_config.yaml")
 
     with trainer.init_module():
-        model = DuplexS2SSpeechDecoderModel(OmegaConf.to_container(cfg, resolve=True))
+        # maybe_wait_for_debugger()
+        
+        # Check if we want to merge LoRA weights
+        lora_init_merge = cfg.model.get("lora_init_merge", False)
+        
+        if lora_init_merge:
+            raise ValueError("LORA merge not ready, would make resuming training fail hence can ony be used during last round of training for now")
         
         if cfg.model.get("pretrained_s2s_train_ckpt", None):
             if (Path(cfg.exp_manager.explicit_log_dir) / 'checkpoints').exists():
+                # using_s2s_train_ckpt = False
                 logging.info("Intermediate checkpoints found in exp dir. We won't restore training ckpt from pretrained_s2s_train_ckpt...") 
+                
+                if lora_init_merge and cfg.model.lora is not None:
+                    cfg.model.lora = None
+                    logging.info("Dropping LoRA config as lora_init_merge was set and we're resuming training")
+                
+                model = DuplexS2SSpeechDecoderModel(OmegaConf.to_container(cfg, resolve=True))
             else:
+                # using_s2s_train_ckpt = True
+                # Get metadata from ckpt directory
+                reader = dcp.FileSystemReader(cfg.model.pretrained_s2s_train_ckpt)
+                meta = reader.read_metadata()
+                
+                # When resuming training, we should not attempt LoRA merge if it was previously done
+                if lora_init_merge and not any([k for k in meta.state_dict_metadata.keys() if 'lora' in k]):
+                    # LoRA already merged, force its config to None (we are resuming training)
+                    cfg.model.lora = None
+                    lora_already_merged = True
+                    logging.info("Dropping LoRA config as lora_init_merge and LoRA were previously merged")
+                else:
+                    lora_already_merged = False
+            
+                model = DuplexS2SSpeechDecoderModel(OmegaConf.to_container(cfg, resolve=True))
+            
                 model = init_from_model_from_train_ckpt(
                     cfg.model.pretrained_s2s_train_ckpt, 
+                    meta,
+                    reader,
                     model,
                     selected_modules=cfg.model.get("selected_init_modules", None)
                 )
+                if lora_init_merge and not lora_already_merged:
+                    if cfg.model.get("lora", None) is None:
+                        raise ValueError("Cannot use lora_init_merge with null LoRA config")
+                    model.llm = model.llm.merge_and_unload()
+                    logging.info("\n.....LoRA weights merged.....\n")
+        else:
+            model = DuplexS2SSpeechDecoderModel(OmegaConf.to_container(cfg, resolve=True))
+            
 
     use_word_pad = cfg.model.tokenizer.get("use_word_pad", None)
     use_alignment_items = cfg.data.get("use_alignment_items", None)
