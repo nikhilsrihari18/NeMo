@@ -109,9 +109,17 @@ def set_model_dict_for_partial_init(pretrained_dict, model_dict):
         if k in model_dict and hasattr(model_dict[k], "numel") and v.numel() != model_dict[k].numel():
             del pretrained_dict[k]
             logging.info(" | > Layer with shape mismatach in the model definition: {}".format(k)) 
+    
+    # model_keys = [k for k in model_dict if k not in pretrained_dict.keys() and not k.startswith('audio_codec')]
+    # pt_model_keys = [k for k in pretrained_dict if k not in model_dict.keys() and not k.startswith('audio_codec')]
+    # print(model_keys)
+    # print(pt_model_keys)
+    
     # 2. filter out unnecessary keys
     pretrained_dict = {k: v for k, v in pretrained_dict.items() if k in model_dict}
+    
     # 3. overwrite entries in the existing state dict
     model_dict.update(pretrained_dict)
+    
     logging.info(" | > {} / {} layers are restored.".format(len(pretrained_dict), len(model_dict)))
     return model_dict

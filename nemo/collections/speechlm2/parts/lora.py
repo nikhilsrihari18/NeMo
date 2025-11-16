@@ -18,11 +18,9 @@ from transformers import PreTrainedModel
 from nemo.utils import logging
 from nemo.collections import llm
 
-def maybe_install_lora(model, lora_init_merge=False, resuming=False):
+def maybe_install_lora(model):
     """Add LoRA adapters to a model, using HuggingFace PEFT library."""
-    if lora_init_merge and resuming:
-        return
-    
+
     if "lora" in model.cfg and model.cfg.lora is not None:
         assert hasattr(model, "cfg") and isinstance(model.cfg, DictConfig)
         assert hasattr(model, "llm") and isinstance(model.llm, PreTrainedModel)
@@ -31,7 +29,4 @@ def maybe_install_lora(model, lora_init_merge=False, resuming=False):
         model.llm = get_peft_model(model.llm, model.lora_config)
         model.cfg.prevent_freeze_params.append(r"^.+\.lora_.+$")
         logging.info(f"LoRA adapter installed: {model.lora_config}")
-        
-    if lora_init_merge and not resuming:
-        model.llm = model.llm.merge_and_unload()
-        logging.info("\nLoRA weights merged.\n")
+

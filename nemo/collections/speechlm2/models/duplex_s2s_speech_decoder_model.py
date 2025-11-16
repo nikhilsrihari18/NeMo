@@ -325,15 +325,8 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         # if r == 0:
         #     import debugpy
         #     debugpy.breakpoint()
-            
-        if self.cfg.get("lora_init_merge", False): 
-            if (Path(cfg.exp_manager.explicit_log_dir) / 'checkpoints').exists():
-                logging.info("Intermediate checkpoints found in exp dir. We won't restore LORA config (previously merged)...") 
-                resuming = True
-            else:
-                resuming = False
-        
-        maybe_install_lora(self, lora_init_merge=self.cfg.get("lora_init_merge", False), resuming=resuming)
+
+        maybe_install_lora(self)
 
         # Load the pretrained streaming ASR model and copy its parameters into the audio perception module.
         setup_speech_encoder(self)
@@ -1317,7 +1310,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
 
         for m in (
             self.perception.preprocessor, self.perception.encoder,
-            self.llm, self.lm_head, self.embed_tokens
+            self.llm, self.lm_head, self.embed_tokens, self.agent_film
         ):
             if self.cfg.get(
                 "tokenizer", None
@@ -1621,6 +1614,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                         self.user_text_eos_acc.update(name='train', refs=inputs["user_text_labels"], hyps=user_pred_tokens)
 
             return ans
+
 
     def on_train_epoch_start(self) -> None:
         setup_audio_codec(self)  # potentially reloads the audio codec to make sure it's in fp32
