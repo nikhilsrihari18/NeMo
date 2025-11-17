@@ -2005,7 +2005,9 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
 
         input_embeds = self.embed_tokens(text_bos)
         return input_embeds
-
+    
+    def _get_eos_embedding(self) -> torch.Tensor:
+        return self.embed_tokens(self.text_bos_id)
 
     @torch.no_grad()
     def offline_inference(
@@ -2155,7 +2157,8 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             speaker_encoder_emb=None,  # for inference uses the cached inference_speaker_embedding
         )
 
-        gen_text[:, 0] = ans["text_logits"][:, -1].argmax(dim=-1)
+        # gen_text[:, 0] = ans["text_logits"][:, -1].argmax(dim=-1)
+        gen_text[:, 0] = self.text_pad_id  # Init agent to pad_id
         if do_user_asr and "user_text_logits" in ans:
             user_gen_text[:, 0] = ans["user_text_logits"][:, -1].argmax(dim=-1)
         if not ignore_speech_gen:
@@ -2228,16 +2231,17 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 
             # User text inference
             if do_user_asr and "user_text_logits" in ans:
-                user_dec = ans["user_text_logits"][:, -1].argmax(dim=-1)
+                # user_dec = ans["user_text_logits"][:, -1].argmax(dim=-1)
+                user_gen_text[:, t] = ans["user_text_logits"][:, -1].argmax(dim=-1)
                 # Inference trick: silence user output after eos
-                user_gen_text[:, t] = torch.where(
-                    is_user_silent,
-                    self.text_pad_id,
-                    user_dec
-                ) # type: ignore
+                # user_gen_text[:, t] = torch.where(
+                #     is_user_silent,
+                #     self.text_pad_id,
+                #     user_dec
+                # ) # type: ignore
 
-                is_user_silent[user_dec == self.text_eos_id] = True
-                is_user_silent[user_dec == self.user_start_ids[0]] = False
+                # is_user_silent[user_dec == self.text_eos_id] = True
+                # is_user_silent[user_dec == self.user_start_ids[0]] = False
              
             # Agent audio inference
             if not ignore_speech_gen:
