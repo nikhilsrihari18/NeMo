@@ -969,6 +969,23 @@ def _strip_timestamps(
     return _SPACE_PATTERN.sub(" ", text).strip()  # strip multi-whitespaces
 
 
+def _fix_boxed_formatting(
+    text: str,
+    _BOXED_PATTERN=re.compile(r'\b(?:boxed([A-Z])|([A-Z])\s+boxed\2|boxed([A-Z])\s+\3)\b'),
+    _SPACE_PATTERN=re.compile(r"\s+")
+) -> str:
+    """
+    Fix text pre-processing errors:
+    boxedA should become A
+    A boxedA should become A
+    boxedB B should become B
+    C boxedC D boxedD should both change
+    """
+    # Regexp pattern args are cached compiled patterns (micro-optimization).
+    text = _BOXED_PATTERN.sub("", text)  # strip timestamp tokens if present
+    return _SPACE_PATTERN.sub(" ", text).strip()  # strip multi-whitespaces
+
+
 def build_token_channel_fc(
     cut: Cut,
     tokenizer: TokenizerSpec,

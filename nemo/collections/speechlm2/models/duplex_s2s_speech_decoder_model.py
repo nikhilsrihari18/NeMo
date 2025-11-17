@@ -2200,8 +2200,8 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                         gen_audio[:, t],
                     )
 
-            if self.cfg.get("stop_inference_on_eos", None) and all(gen_text[:, t] == self.text_eos_id):
-                break
+            # if self.cfg.get("stop_inference_on_eos", None) and all(gen_text[:, t] == self.text_eos_id):  # WRONG !
+            #     break
        
         # Trim back to local length if padded
         if self._use_fsdp and T > T_local:
