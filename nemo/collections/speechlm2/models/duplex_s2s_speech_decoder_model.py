@@ -319,6 +319,14 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 z_dim = 128  # TODO: add to config and test larger values
                 # z_dim = 512
             )
+            if self.cfg.get("with_user_film_cond", None):
+                self.user_film = FiLMConditioner(
+                    hidden_size,
+                    hidden_size,
+                    # llm.config.vocab_size,
+                    z_dim = 128  # TODO: add to config and test larger values
+                    # z_dim = 512
+                )
             
         # r = dist.get_rank() if dist.is_initialized() else -1
         # print(f"[DEBUG] entered train_step on rank={r}, LOCAL_RANK={os.environ.get('LOCAL_RANK')}")
@@ -626,7 +634,11 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             agent_gated_hidden = self.agent_film(x, cond_embed)
             text_logits = self.lm_head(agent_gated_hidden)  # (B, T, text_vocab_size)
             
-            user_text_logits = self.lm_head(x)  # (B, T, text_vocab_size)
+            if self.cfg.get("with_user_film_cond", None):
+                user_gated_hidden = self.user_film(x, cond_embed)
+                user_text_logits = self.lm_head(user_gated_hidden)  # (B, T, text_vocab_size)
+            else:
+                user_text_logits = self.lm_head(x)  # (B, T, text_vocab_size)
 
         else:
             text_logits = self.lm_head(out['last_hidden_state'])  # (B, T, text_vocab_size)
@@ -1307,11 +1319,15 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
 
     def training_step(self, batch: dict, batch_idx: int):
         ignore_speech_gen = self.cfg.get("ignore_speech_gen", None)
+        
+        modules = [self.perception.preprocessor, self.perception.encoder,
+            self.llm, self.lm_head, self.embed_tokens]
+        if self.cfg.get("use_film_cond", None):
+            modules.append(self.agent_film)
+            if self.cfg.get("with_user_film_cond", None):
+                modules.append(self.user_film)
 
-        for m in (
-            self.perception.preprocessor, self.perception.encoder,
-            self.llm, self.lm_head, self.embed_tokens, self.agent_film
-        ):
+        for m in modules:
             if self.cfg.get(
                 "tokenizer", None
                 ) and self.cfg.tokenizer.get("train_new_embeddings", None) and m is self.embed_tokens:
@@ -2345,6 +2361,8 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 self.speech_generation = fully_shard(self.speech_generation, **fsdp_config)
             if self.cfg.get("use_film_cond", None):
                 self.agent_film = fully_shard(self.agent_film, **fsdp_config)
+                if self.cfg.get("with_user_film_cond", None):
+                    self.user_film = fully_shard(self.user_film, **fsdp_config)
 
 
     def generate_silence_tokens(self, time_steps: int, num_codebooks: int) -> torch.Tensor:
