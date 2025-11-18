@@ -1099,6 +1099,8 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                     source_tokens.eq(self.word_pad_id[0]) | 
                     source_tokens.eq(self.word_epad_id[0]) 
                 )
+                
+            # user_eos_pos = source_tokens.eq(self.text_eos_id)
 
             # Set agent padding token embeddings to 0
             padding_pos = agent_padding_pos   # & ~user_padding_pos : do it just once (for user below) you end up summing            
