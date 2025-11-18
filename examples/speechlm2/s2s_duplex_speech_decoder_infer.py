@@ -171,11 +171,13 @@ def inference(cfg):
         force_align_agent_text=force_align_agent_text,
         skip_agent_word_padding=skip_agent_word_padding
     )
+    
+    # maybe_wait_for_debugger()
+    
     datamodule = DataModule(cfg.data, tokenizer=model.tokenizer, dataset=dataset)
 
+        
     trainer.validate(model, datamodule)
-
-    # maybe_wait_for_debugger()
 
 if __name__ == "__main__":
     inference()

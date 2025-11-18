@@ -108,9 +108,7 @@ def delay_eos(tokens, eos_token_id, pad_token_id, shift=10):
             tokens[b_idx, new_pos] = eos_token_id
     return tokens
 
-
-def tokens_to_text(batch_ids, tokenizer, text_only=False):
-    texts = []
+def disp_txt_with_special_tokens(text):
     disp_norm = {
         "<SPECIAL_990>": "|990|",
         "<SPECIAL_980>": "|980|",
@@ -119,6 +117,13 @@ def tokens_to_text(batch_ids, tokenizer, text_only=False):
         "<SPECIAL_12>": "|12|",
         "<unk>": "-"
     }
+    for ky in disp_norm:
+        text = text.replace(ky, disp_norm[ky])
+    return text
+
+def tokens_to_text(batch_ids, tokenizer, text_only=False):
+    texts = []
+
     for idx in range(batch_ids.shape[0]):
         ids = batch_ids[idx]
         # Convert tensor/np array to a Python list
@@ -135,9 +140,7 @@ def tokens_to_text(batch_ids, tokenizer, text_only=False):
             ids, skip_special_tokens=text_only,
             clean_up_tokenization_spaces=text_only
         )
-        for ky in disp_norm:
-            decod = decod.replace(ky, disp_norm[ky])
-        texts.append(decod)
+        texts.append(disp_txt_with_special_tokens(decod))
     return texts
 
 
@@ -1959,21 +1962,23 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 if user_text is not None:
                     result_entry["pred_user_text"] = user_text[i]
                 if user_text_with_special_tokens is not None:
-                    result_entry["pred_user_text_with_special_tokens"] = user_text_with_special_tokens[i]
+                    result_entry["pred_user_text_with_special_tokens"] = disp_txt_with_special_tokens(user_text_with_special_tokens[i])
+                    logging.info(f"\n[USER HYP]:  {result_entry["pred_user_text_with_special_tokens"]}")
                 self.validation_results[name].append(result_entry)
+            
             # import pdb; pdb.set_trace()
-            logging.info(f"dataset_batch['target_texts']: {dataset_batch['target_texts']}")
-            logging.info(f"results['text']: {results['text']}")
-            logging.info(f"name: {name}")
+            # logging.info(f"dataset_batch['target_texts']: {dataset_batch['target_texts']}")
+            # logging.info(f"results['text']: {results['text']}")
+            # logging.info(f"name: {name}")
 
             self.val_bleu.update(name=name, refs=dataset_batch["target_texts"], hyps=results["text"])
-            logging.info(f"self.val_bleu._refs: {self.val_bleu._refs}")
-            logging.info(f"self.val_bleu._hyps: {self.val_bleu._hyps}")
-            logging.info(f"self.dataset_batch['target_tokens']: {dataset_batch["target_tokens"]}")
-            logging.info(f"results['tokens_text']: {results["tokens_text"]}")
+            # logging.info(f"self.val_bleu._refs: {self.val_bleu._refs}")
+            # logging.info(f"self.val_bleu._hyps: {self.val_bleu._hyps}")
+            # logging.info(f"self.dataset_batch['target_tokens']: {dataset_batch["target_tokens"]}")
+            # logging.info(f"results['tokens_text']: {results["tokens_text"]}")
             self.val_text_bos_acc.update(name=name, refs=dataset_batch["target_tokens"], hyps=results["tokens_text"])
-            logging.info(f"self.dataset_batch['target_tokens']: {dataset_batch["target_tokens"]}")
-            logging.info(f"results['tokens_text']: {results["tokens_text"]}")
+            # logging.info(f"self.dataset_batch['target_tokens']: {dataset_batch["target_tokens"]}")
+            # logging.info(f"results['tokens_text']: {results["tokens_text"]}")
             self.val_text_eos_acc.update(name=name, refs=dataset_batch["target_tokens"], hyps=results["tokens_text"])
 
     def on_test_epoch_start(self) -> None:
@@ -2111,6 +2116,12 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         gen_text = torch.zeros(B, T, device=self.device, dtype=torch.long)
         user_gen_text = torch.zeros(B, T, device=self.device, dtype=torch.long) if do_user_asr else None
 
+        # r = dist.get_rank() if dist.is_initialized() else -1
+        # print(f"[DEBUG] entered train_step on rank={r}, LOCAL_RANK={os.environ.get('LOCAL_RANK')}")
+        # if r == 0:
+        #     import debugpy
+        #     debugpy.breakpoint()
+
         # -- First step, use init tokens  -------
         if self.system_prompt is not None or self.use_chat_template:
             init_seq = self._get_bos_embedding()
@@ -2156,6 +2167,12 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             asr_emb=step_asr_emb,
             speaker_encoder_emb=None,  # for inference uses the cached inference_speaker_embedding
         )
+        
+        # r = dist.get_rank() if dist.is_initialized() else -1
+        # print(f"[DEBUG] entered train_step on rank={r}, LOCAL_RANK={os.environ.get('LOCAL_RANK')}")
+        # if r == 0:
+        #     import debugpy
+        #     debugpy.breakpoint()
 
         # gen_text[:, 0] = ans["text_logits"][:, -1].argmax(dim=-1)
         gen_text[:, 0] = self.text_pad_id  # Init agent to pad_id
