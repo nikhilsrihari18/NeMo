@@ -34,6 +34,9 @@ from nemo.collections.speechlm2.data.force_align import ForceAligner
 from nemo.utils import logging
 from nemo.collections.common.data.lhotse.text_adapters import Formattable
 
+import torch.distributed as dist  # debugging
+import os
+
 from typing import Tuple
 
 MIN_FRAMES_FOR_TEXT = 3
@@ -742,7 +745,8 @@ def build_aligned_tokens(
     text_overflow = False
 
     # Add space before each word so it's tokenized similarly to a sentence. Note that token('<word>') != token(' <word>')
-    text_ids = torch.as_tensor(tokenizer.text_to_ids(" " + alignment.symbol))
+    # text_ids = torch.as_tensor(tokenizer.text_to_ids(" " + alignment.symbol))
+    text_ids = torch.as_tensor(tokenizer.text_to_ids(alignment.symbol))
     
     start_pos = compute_num_frames(alignment.start, frame_length, sampling_rate)
     if superv_start_pos + start_pos >= tokens_len:
@@ -760,7 +764,7 @@ def build_aligned_tokens(
     # We leave some margin for short duration words (could be imperfect)
     if available_frames_for_text < MIN_FRAMES_FOR_TEXT:
         available_frames_for_text = MIN_FRAMES_FOR_TEXT
-        eos_pos = MIN_FRAMES_FOR_TEXT  
+        eos_pos = MIN_FRAMES_FOR_TEXT + start_pos 
           
     if available_frames_for_text > 0 and len(text_ids) > available_frames_for_text:
         # Truncate text_ids to fit before the eos position.
@@ -778,7 +782,7 @@ def build_aligned_tokens(
                 f"Truncating training example's *word* text_ids of length {len(text_ids)} to {trunc_len} because end pos {end_pos + superv_start_pos} > {tokens_len=}. {diagnostic}\n"
             )
         text_ids = text_ids[:trunc_len]
-        end_pos = start_pos + len(text_ids) 
+        end_pos = start_pos + len(text_ids)
         text_overflow = True 
 
     return text_ids, start_pos, end_pos, eos_pos, text_overflow
@@ -806,7 +810,13 @@ def build_token_channel(
     total = compute_num_frames(cut.duration, frame_length, cut.sampling_rate)
     tokens = torch.ones(total + delay_user_txt_by, dtype=torch.long) * pad_id
     activity_mask = torch.zeros_like(tokens)
-    
+
+    # r = dist.get_rank() if dist.is_initialized() else -1
+    # print(f"[DEBUG] entered train_step on rank={r}, LOCAL_RANK={os.environ.get('LOCAL_RANK')}")
+    # if r == 0:
+    #     import debugpy
+    #     debugpy.breakpoint()
+        
     agent_bos_id = get_chat_start_ids(tokenizer, True, version=model_version)
     user_bos_id = get_chat_start_ids(tokenizer, False, version=model_version)
     bos_ids = None
@@ -825,11 +835,10 @@ def build_token_channel(
             i_start = fst_pos
             i_end = i_start + 1
             
-            if False:
-            # (
-            #     data_format == 'shars' and use_alignment_items and 
-            #     supervision.alignment is not None and len(supervision.alignment['word']) > 0
-            # ):                
+            if (
+                data_format == 'shars' and use_alignment_items and 
+                supervision.alignment is not None and len(supervision.alignment['word']) > 0
+            ):                
                 prev_end_pos = 0
                 for idx, alignment in enumerate(supervision.alignment['word']):
                     if alignment is None:
@@ -855,11 +864,12 @@ def build_token_channel(
                             f"{text_ids.shape=} {diagnostic}"
                         ) from e
 
-                lst_pos = i_end  #  + len(bos_ids)  # !!! CHECK THIS !!!
+                lst_pos = i_end
                 tokens[fst_pos:lst_pos] = _insert_word_padding(
                     tokens[fst_pos:lst_pos],
                     pad_id, word_pad_id, word_epad_id
                 )
+                
                 # Add bos tokens
                 fst_pos -= len(bos_ids) 
                 # Safe insertion
@@ -869,7 +879,7 @@ def build_token_channel(
                 elif fst_pos < len(tokens):
                     # print(f"Skipping prefix insertion: fst_pos={fst_pos}, prefix_len={len(bos_ids)}, tokens_len={tokens.size(0)}")
                     # We must insert at least the first bos token id
-                    tokens[fst_pos]
+                    tokens[fst_pos] = bos_ids[0]
 
                 # Add eos tokens
                 eos_pos = fst_pos + last_nonzero_index(tokens[fst_pos:lst_pos]) + 1 
@@ -877,11 +887,11 @@ def build_token_channel(
                 if eos_pos < len(tokens):
                     tokens[eos_pos] = tokenizer.eos 
                     # Keep padding within segments unmasked
-                    activity_mask[fst_pos:lst_pos] = 1
+                    activity_mask[max(fst_pos-delay_user_txt_by-1,0):lst_pos] = 1  # delay_user_txt_by-1 to see the transition from padding to bos
                 else:  # more text than expected, we should still force an eos
                     tokens[-1] = tokenizer.eos
                     # Keep padding within segments unmasked
-                    activity_mask[fst_pos:] = 1
+                    activity_mask[max(fst_pos-delay_user_txt_by-1,0):] = 1
             else:
                 if start_pos >= len(tokens) + 4:  # +4 for less verbose warnings
                     logging.warning(
@@ -930,16 +940,16 @@ def build_token_channel(
                             f"{trunc_len} because {end_pos=} > {len(tokens)=}. {diagnostic}\n"
                         )
                     text_ids = text_ids[:trunc_len]
-                    end_pos = start_pos + len(text_ids)  
+                    end_pos = start_pos + len(text_ids)
 
                 try:
                     tokens[start_pos:end_pos] = text_ids
                     # Keep padding within segments unmasked
-                    activity_mask[max(start_pos-delay_user_txt_by-1,0):end_pos] = 1  # delay_user_txt_by 1 to see the transition from padding to bos
+                    activity_mask[max(start_pos-delay_user_txt_by-1,0):end_pos] = 1  # delay_user_txt_by-1 to see the transition from padding to bos
                 except Exception as e:
                     raise RuntimeError(f"{tokens.shape=} {start_pos=} {end_pos=} {text_ids.shape=} {diagnostic}") from e
 
-                eos_pos = start_pos + last_nonzero_index(tokens[start_pos:end_pos]) + 1 # NEW! 
+                eos_pos = start_pos + last_nonzero_index(tokens[start_pos:end_pos]) + 1
 
                 if eos_pos < len(tokens):
                     tokens[eos_pos] = tokenizer.eos
@@ -951,6 +961,9 @@ def build_token_channel(
     
     if bos_ids is not None:  # Ensure we went through some supervisions above
         tokens = _correct_ebos(tokens, tokenizer.eos, bos_ids, pad_id, word_pad_id, word_epad_id, diagnostic)
+        
+        
+    # dist.barrier()   # !!!!!
     
     return tokens, activity_mask
 

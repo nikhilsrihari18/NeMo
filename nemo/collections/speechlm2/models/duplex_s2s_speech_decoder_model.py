@@ -1135,6 +1135,12 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 device=self.device,
                 dtype=torch.bool,
             )
+            if self.cfg.get("do_user_asr", None):
+                user_seq_mask = torch.ones_like(
+                    user_text_labels.unsqueeze(-1),
+                    device=self.device,
+                    dtype=torch.bool,
+                )
         if self.cfg.get("mask_sequence_loss", True):
             # set the mask based on the target_token_lens to disconsider sequence padding in loss
             for i in range(batch["target_token_lens"].size(0)):
@@ -1143,6 +1149,15 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             # check new mask consistency
             mask_lengths = seq_mask[:, :, 0].sum(-1)
             assert torch.allclose(batch["target_token_lens"].float(), mask_lengths.float(), atol=2.0)
+            
+            if self.cfg.get("do_user_asr", None):
+                # set the mask based on the target_token_lens to disconsider sequence padding in loss
+                for i in range(batch["source_token_lens"].size(0)):
+                    speech_end_idx = batch["source_token_lens"][i]
+                    user_seq_mask[i, speech_end_idx:, :] = 0
+                # check new mask consistency
+                mask_lengths = user_seq_mask[:, :, 0].sum(-1)
+                assert torch.allclose(batch["source_token_lens"].float(), mask_lengths.float(), atol=4.0)
 
         # create loss scale mask by copying seq_mask to include mask sequence
         loss_scale = seq_mask.clone().float()
@@ -1154,26 +1169,41 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             )
         if self.use_word_pad and self.cfg.get("scale_word_pad_loss_by", 1.) != 1:
             loss_scale[:, :, :1] = torch.where(
-                text_labels.unsqueeze(-1) == self.word_pad_id[0],
+                (text_labels.unsqueeze(-1) == self.word_pad_id[0]) | (text_labels.unsqueeze(-1) == self.word_epad_id[0]),
                 float(self.cfg.get("scale_word_pad_loss_by")),
                 loss_scale[:, :, :1]
             )
             
         user_loss_scale = None
         if self.cfg.get("do_user_asr", None):
-            user_loss_scale = source_activity.clone().float()
+            user_loss_scale = user_seq_mask.clone().float()
             if self.cfg.get("scale_loss_by") == 'non_sil_t':
-                user_loss_scale = torch.where(
-                    user_text_labels != self.text_pad_id,
+                user_loss_scale[:, :, :1] = torch.where(
+                    user_text_labels.unsqueeze(-1) != self.text_pad_id,
                     self.cfg.get("scale_loss_mask", self.cfg.get("nonsil_weight", 4.0)),
-                    user_loss_scale,
-                ) # type: ignore
-            if self.use_word_pad and self.cfg.get("scale_word_pad_loss_by", 1.) != 1:
-                user_loss_scale = torch.where(
-                    user_text_labels== self.word_pad_id[0],
-                    self.cfg.get("scale_word_pad_loss_by"),
-                    user_loss_scale
+                    user_loss_scale[:, :, :1],
                 )
+            if self.use_word_pad and self.cfg.get("scale_word_pad_loss_by", 1.) != 1:
+                user_loss_scale[:, :, :1] = torch.where(
+                    (user_text_labels.unsqueeze(-1) == self.word_pad_id[0]) | (user_text_labels.unsqueeze(-1) == self.word_epad_id[0]),
+                    float(self.cfg.get("scale_word_pad_loss_by")),
+                    user_loss_scale[:, :, :1]
+                )
+            # The following is not OK is the loss is 0 every time the user is inactive, contrary to above,
+            # where it is lower but not zero
+            # user_loss_scale = source_activity.clone().float()
+            # if self.cfg.get("scale_loss_by") == 'non_sil_t':
+            #     user_loss_scale = torch.where(
+            #         user_text_labels != self.text_pad_id,
+            #         self.cfg.get("scale_loss_mask", self.cfg.get("nonsil_weight", 4.0)),
+            #         user_loss_scale,
+            #     ) # type: ignore
+            # if self.use_word_pad and self.cfg.get("scale_word_pad_loss_by", 1.) != 1:
+            #     user_loss_scale = torch.where(
+            #         user_text_labels == self.word_pad_id[0],
+            #         self.cfg.get("scale_word_pad_loss_by"),
+            #         user_loss_scale
+            #     )
 
         # debug samples:
         if (
@@ -1487,7 +1517,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                         )
                         
                         user_text_loss = (
-                            user_ce * inputs["user_loss_scale"].flatten(0, 1)
+                            user_ce * inputs["user_loss_scale"][:, :, 0].flatten(0, 1)
                         ).sum(-1) / num_user_frames
 
                         num_eos = torch.count_nonzero(user_eos_mask)
@@ -1511,7 +1541,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                     text_loss = (
                         agent_text_loss + agent_eos_loss * loss_w[0] + agent_bos_loss * loss_w[1] +
                         loss_w[2] * user_text_loss + user_eos_loss * loss_w[3] + user_bos_loss * loss_w[4]
-                    ) / 100  # 1000  TODO: move scale (100) to config
+                    ) / 100  #  TODO: move scale (100) to config
                 else:
                     text_logits = forward_outputs["text_logits"]
                     # mask text logits to ignore sequence padding
@@ -1581,7 +1611,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 user_ref_tokens = inputs["user_text_labels"]
                 if self.cfg.get("do_user_asr", None):
                     user_pred_tokens = user_text_logits.argmax(dim=-1)
-                    if not self.cfg.get("use_film_cond", None):
+                    if not self.cfg.get("use_film_cond", None):   # Note this! And the following had better use user_seq_mask
                         # Mask tokens where user is inactive. This results in an optimistic view of things
                         user_pred_tokens = torch.where(
                             inputs["source_activity"].squeeze(-1) != 0,

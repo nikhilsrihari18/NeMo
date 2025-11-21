@@ -179,8 +179,7 @@ def train(cfg):
     # maybe_wait_for_debugger()
 
     trainer.fit(model, datamodule)
-    
-    # trainer.validate(model, datamodule)
+
    
 if __name__ == "__main__":
     train()
