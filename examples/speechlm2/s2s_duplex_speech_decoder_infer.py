@@ -175,7 +175,6 @@ def inference(cfg):
     # maybe_wait_for_debugger()
     
     datamodule = DataModule(cfg.data, tokenizer=model.tokenizer, dataset=dataset)
-
         
     trainer.validate(model, datamodule)
 
