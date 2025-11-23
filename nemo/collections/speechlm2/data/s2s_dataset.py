@@ -19,7 +19,9 @@ from typing import Tuple
 
 import torch
 import torch.utils.data
+# from torchaudio.functional import filtfilt
 # import torchaudio
+# import audio_dspy as adsp
 
 from lhotse import CutSet, MonoCut, Recording, Seconds, SupervisionSegment, compute_num_frames, compute_num_samples
 from lhotse.supervision import AlignmentItem
@@ -40,6 +42,84 @@ import os
 from typing import Tuple
 
 MIN_FRAMES_FOR_TEXT = 3
+
+
+
+# def apply_eq(signal, eq, sampling_rate=16000, display=False):
+#     """
+#     Filter a signal with a low-pass/high-pass/band-pass/band-stop
+#     Butterworth filter.
+
+#     Parameters
+#     ----------
+#     signal: ndarray of floats (shape [n_channels, n_samples])
+#         signal to filter
+
+#     sampling_rate: int
+#         sampling rate of the signal
+
+#     eq: audio_dspy.eq.EQ
+#         audio_dspy EQ instance containing filter parameters in .filters
+
+#     display: bool (default False)
+#         display input signal vs filtered signal
+
+#     Returns
+#     -------
+#     ndarray of floats (shape [n_channels, n_samples])
+#         filtered signal
+#     """
+
+#     # Apply filters
+#     for filter in eq.filters:
+#         filt_signal = filtfilt(filter.b_coefs, filter.a_coefs, signal, axis=-1)
+
+#     if np.any(np.isnan(filt_signal)):
+#         raise ValueError('NaN found in filtered signal')
+
+#     if filt_signal.dtype != signal.dtype:
+#         filt_signal = filt_signal.astype(signal.dtype)
+
+
+#     return filt_signal
+
+
+
+
+# def get_random_eq(sampling_rate, display=False):
+#   """Generate random EQ"""
+#   eq = adsp.EQ(sampling_rate)
+
+#   # Choose a filter type among low_shelf, bell, high_shelf
+#   filter_type_choice = np.random.randint(3)
+
+#   if filter_type_choice == 0:  # low_shelf
+#     cutoff_freq = np.random.uniform(100, 400)
+#     gain = np.random.uniform(1.05, 1.5)
+#     q_factor = np.random.uniform(0.1, 0.8)
+#     eq.add_lowshelf(cutoff_freq, q_factor, gain)
+
+#   if filter_type_choice == 1:  # bell
+#     # How many bands? 1 to 3
+#     n_bands = np.random.randint(1, 4)
+#     for sb in range(n_bands):
+#       cutoff_freq = np.random.uniform(100, 6000)
+#       gain = np.random.uniform(1.05, 1.5)
+#       q_factor = np.random.uniform(0.1, 1)
+#       eq.add_bell(cutoff_freq, q_factor, gain)
+
+#   if filter_type_choice == 2:  # high_shelf
+#     cutoff_freq = np.random.uniform(5000, 6000)
+#     gain = np.random.uniform(1.05, 1.5)
+#     q_factor = np.random.uniform(0.1, 0.8)
+#     eq.add_highshelf(cutoff_freq, q_factor, gain)
+
+#   if display:
+#     plt.figure()
+#     eq.plot_eq_curve()
+#     plt.show(block=False)
+
+#   return eq
 
 
 def first_nonzero_idx_torch(x: torch.Tensor, zero_value: int = 0, none_value: int = -1):
