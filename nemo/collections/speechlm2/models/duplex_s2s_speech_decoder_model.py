@@ -20,12 +20,23 @@ import random
 import tempfile
 from pathlib import Path
 from collections import defaultdict
-from typing import Callable, Iterable, Optional, Tuple, List
+from typing import Callable, Iterable, Optional, Tuple, List, Union
 
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 import torchaudio
+from torch_audiomentations import (
+    Compose,
+    AddBackgroundNoise,
+    Gain,
+    BandPassFilter,
+    LowPassFilter,
+    PitchShift,
+    Shift,
+    AddColoredNoise,
+    PolarityInversion
+)
 from lightning import LightningModule
 from omegaconf import DictConfig, OmegaConf
 from peft import PeftModel
@@ -66,7 +77,7 @@ from nemo.collections.speechlm2.parts.pretrained import (
 from nemo.core.neural_types import AudioSignal, LabelsType, LengthsType, NeuralType
 from nemo.utils import logging
 
-
+    
 def delay_eos(tokens, eos_token_id, pad_token_id, shift=10):
     """
     Delays each EOS token by `shift` steps forward. Replaces original EOS with PAD.
@@ -832,6 +843,81 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
 
         return batch_audio
 
+    def _build_audio_aug(
+        self, 
+        audio_samples: torch.Tensor, 
+        noise_files: List[Union[str, Path]]
+    ) -> torch.Tensor:
+        """
+        Construct and apply an audio augmentation pipeline to the input batch.
+
+        Parameters
+        audio_samples : torch.Tensor
+            Input audio batch.
+        noise_files : List[str] or List[Path]
+            List of paths to WAV noise files that will be used by
+            AddBackgroundNoise.
+
+        Returns
+        torch.Tensor
+            Augmented audio batch, same shape as `audio_samples`.
+        """
+        # Ensure correct shape
+        if audio_samples.dim() == 2:            # [B, T]
+            audio_samples = audio_samples.unsqueeze(1)  # [B, 1, T]
+        elif audio_samples.dim() == 1:          # [T]
+            audio_samples = audio_samples.unsqueeze(0).unsqueeze(0)
+
+        # Define augmentation
+        apply_augmentation = Compose(
+            transforms=[
+                AddBackgroundNoise(
+                    background_paths=[str(f) for f in noise_files],
+                    min_snr_in_db=5,
+                    max_snr_in_db=25,
+                    p=0.8,
+                ),
+                Gain(
+                    min_gain_in_db=-6,
+                    max_gain_in_db=6,
+                    p=0.8,
+                ),
+                PitchShift(
+                    min_transpose_semitones=-1.0,
+                    max_transpose_semitones=1.0,
+                    sample_rate=self.source_sample_rate,
+                    p=0.3,
+                ),
+                Shift(
+                    min_shift=-0.015,
+                    max_shift=0.015,
+                    shift_unit="seconds",
+                    rollover=False,
+                    p=0.3,
+                ),
+                BandPassFilter(
+                    min_center_frequency=200,
+                    max_center_frequency=4000,
+                    min_bandwidth_fraction=0.5,
+                    max_bandwidth_fraction=1.99,
+                    p=0.7,
+                ),
+                LowPassFilter(
+                    min_cutoff_freq=150.0,
+                    max_cutoff_freq=7500.0,
+                    p=0.4,
+                ),
+                PolarityInversion(p=0.5),
+            ]
+        )
+
+        # Apply augmentation
+        transformed_audio =  apply_augmentation(audio_samples, sample_rate=self.source_sample_rate)
+
+        # Remove channel dim [B, 1, T] -> [B, T]
+        return transformed_audio.squeeze(1)
+
+
     def prepare_inputs(self, batch: dict):
         """
         Similar to DuplexS2SModel.prepare_inputs, with following changes:
@@ -875,34 +961,20 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                     noise_prob_low_pass=0.1,
                 )
         elif self.cfg.get('use_audio_aug', None):
-            # change audio volume randomly
-            if self.training and random.random() < self.cfg.get('noise_prob_scale_user', 0.0):
-                # prev codebase had 0.0631 and 5.6234 here we round the values
-                min_scale_val = self.cfg.get('noise_scale_user_min', 0.0631)  # -15 snr
-                max_scale_val = self.cfg.get('noise_scale_user_min', 5.6234)  # 24 snr
-
-                # get a random float value between min and max
-                scaling_factor = (
-                    torch.rand(batch["source_audio"].size(0), device=batch["source_audio"].device)
-                    * (max_scale_val - min_scale_val)
-                    + min_scale_val
+            if self.training:
+                noise_path = self.cfg.get(
+                    'old_noise_aug_path',
+                    None
                 )
-                batch["source_audio"] = batch["source_audio"] * scaling_factor.unsqueeze(-1)
-
-            # apply low pass filter
-            if self.training and random.random() < self.cfg.get('noise_prob_low_pass', 0.0):
-                # prev codebase had 0.0631 and 5.6234 here we round the values
-                cutoff_freq = self.cfg.get('noise_low_pass_cutoff_freq', 1000.0)
-                # note here we are using a biquad filter, older codebase we are using a filter of order 5
-                batch["source_audio"] = torchaudio.functional.lowpass_biquad(
-                    waveform=batch["source_audio"], sample_rate=self.source_sample_rate, cutoff_freq=cutoff_freq
-                )
+                noise_files_paths = list(Path(noise_path).rglob("*.wav"))
+                augmented = self._build_audio_aug(audio_samples=batch["source_audio"], noise_files=noise_files_paths)
 
         source_encoded, source_encoded_lens, asr_emb = self.perception(
             input_signal=batch["source_audio"],
             input_signal_length=batch["source_audio_lens"],
             return_encoder_emb=True,
         )
+
 
         # zero-pad during system prompt : now done in loader
 
