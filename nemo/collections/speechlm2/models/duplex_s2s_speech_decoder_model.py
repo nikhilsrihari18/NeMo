@@ -22,21 +22,26 @@ from pathlib import Path
 from collections import defaultdict
 from typing import Callable, Iterable, Optional, Tuple, List, Union
 
+import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+
 import torchaudio
 from torch_audiomentations import (
     Compose,
     AddBackgroundNoise,
     Gain,
-    BandPassFilter,
+    # BandPassFilter,
     LowPassFilter,
     PitchShift,
-    Shift,
-    AddColoredNoise,
-    PolarityInversion
+    # Shift,
+    # AddColoredNoise,
+    # PolarityInversion
 )
+from torchaudio.functional import filtfilt
+import audio_dspy as adsp
+
 from lightning import LightningModule
 from omegaconf import DictConfig, OmegaConf
 from peft import PeftModel
@@ -261,6 +266,14 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         self.source_fps = self.source_sample_rate / (
             self.source_sample_rate * cfg.data.frame_length
         )  # conver frame rate in fps
+        
+        # Noise files for augmentation?
+        if False:  # self.cfg.get('use_audio_aug', None):
+            noise_path = self.cfg.get('old_noise_aug_path', None)
+            if noise_path is None:
+                raise ValueError("Noise file path cannot be None")
+            self.noise_files_paths = list(Path(noise_path).rglob("*.wav"))
+        self.noise_files_paths = None
 
         setup_audio_codec(self)
         self._codebook_size = self.audio_codec.vector_quantizer.codebook_size_per_group
@@ -337,6 +350,12 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                     # llm.config.vocab_size,
                     z_dim = 128  # TODO: add to config and test larger values
                     # z_dim = 512
+                )
+            if self.cfg.get("with_user_lstm_head", None):
+                self.user_lstm_head = torch.nn.LSTM(
+                    hidden_size, 
+                    hidden_size,
+                    batch_first=True                    
                 )
             
         # r = dist.get_rank() if dist.is_initialized() else -1
@@ -607,6 +626,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         asr_emb=None,
         speaker_encoder_emb=None,
         llm_kwargs={},
+        user_lstm_states=None
     ) -> dict[str, Tensor]:
         """
         Separated text and speech prediction:
@@ -647,8 +667,12 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             
             if self.cfg.get("with_user_film_cond", None):
                 user_gated_hidden = self.user_film(x, cond_embed)
+                if self.cfg.get("with_user_lstm_head", None):
+                    user_gated_hidden, user_lstm_states = self.user_lstm_head(user_gated_hidden, user_lstm_states)
                 user_text_logits = self.lm_head(user_gated_hidden)  # (B, T, text_vocab_size)
             else:
+                if self.cfg.get("with_user_lstm_head", None):
+                    x, user_lstm_states = self.user_lstm_head(x, user_lstm_states)
                 user_text_logits = self.lm_head(x)  # (B, T, text_vocab_size)
 
         else:
@@ -726,6 +750,9 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         }
         if self.cfg.get("do_user_asr", None):
             ans["user_text_logits"] = user_text_logits
+        
+        if self.cfg.get("with_user_lstm_head", None):
+            ans["user_lstm_states"] = user_lstm_states
         
         if cache is not None:
             ans["cache"] = out[cache_key]
@@ -843,6 +870,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
 
         return batch_audio
 
+
     def _build_audio_aug(
         self, 
         audio_samples: torch.Tensor, 
@@ -867,16 +895,24 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             audio_samples = audio_samples.unsqueeze(1)  # [B, 1, T]
         elif audio_samples.dim() == 1:          # [T]
             audio_samples = audio_samples.unsqueeze(0).unsqueeze(0)
+            
+        # TODO: add random seed control
+        
+        # Random EQ
+        if np.random.rand() > 0.1:
+            eq = get_random_eq(self.source_sample_rate)
+            with fp32_precision():
+                audio_samples = apply_eq(audio_samples, eq)
 
         # Define augmentation
         apply_augmentation = Compose(
             transforms=[
-                AddBackgroundNoise(
-                    background_paths=[str(f) for f in noise_files],
-                    min_snr_in_db=5,
-                    max_snr_in_db=25,
-                    p=0.8,
-                ),
+                # AddBackgroundNoise(
+                #     background_paths=[str(f) for f in noise_files],
+                #     min_snr_in_db=5,
+                #     max_snr_in_db=25,
+                #     p=0.8,
+                # ),
                 Gain(
                     min_gain_in_db=-6,
                     max_gain_in_db=6,
@@ -886,33 +922,45 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                     min_transpose_semitones=-1.0,
                     max_transpose_semitones=1.0,
                     sample_rate=self.source_sample_rate,
-                    p=0.3,
+                    p=0.2,
                 ),
-                Shift(
-                    min_shift=-0.015,
-                    max_shift=0.015,
-                    shift_unit="seconds",
-                    rollover=False,
-                    p=0.3,
-                ),
-                BandPassFilter(
-                    min_center_frequency=200,
-                    max_center_frequency=4000,
-                    min_bandwidth_fraction=0.5,
-                    max_bandwidth_fraction=1.99,
-                    p=0.7,
-                ),
+                # Shift(
+                #     min_shift=-0.015,
+                #     max_shift=0.015,
+                #     shift_unit="seconds",
+                #     rollover=False,
+                #     p=0.3,
+                # ),
+                # BandPassFilter(
+                #     min_center_frequency=200,
+                #     max_center_frequency=4000,
+                #     min_bandwidth_fraction=0.5,
+                #     max_bandwidth_fraction=1.99,
+                #     p=0.7,
+                # ),
                 LowPassFilter(
-                    min_cutoff_freq=150.0,
+                    min_cutoff_freq=5000.0,
                     max_cutoff_freq=7500.0,
-                    p=0.4,
+                    p=0.4
                 ),
-                PolarityInversion(p=0.5),
+                # PolarityInversion(p=0.5),
             ]
         )
 
         # Apply augmentation
-        transformed_audio =  apply_augmentation(audio_samples, sample_rate=self.source_sample_rate)
+        with fp32_precision():
+            transformed_audio =  apply_augmentation(audio_samples, sample_rate=self.source_sample_rate)
+        
+
+        # If any sample's absolute peak > 1, rescale that sample so its peak becomes 0.85
+        # reduce over all non-batch dims (works for [B,T], [B,1,T], [B,C,T], etc.)
+        reduce_dims = tuple(range(1, transformed_audio.dim()))
+        max_abs = transformed_audio.abs().amax(dim=reduce_dims)  # shape: (B,)
+        eps = 1e-12
+        scale = torch.where(max_abs > 1.0, 0.85 / (max_abs + eps), torch.ones_like(max_abs))
+        # broadcast scale to audio shape
+        view_shape = [transformed_audio.shape[0]] + [1] * (transformed_audio.dim() - 1)
+        transformed_audio = transformed_audio * scale.view(*view_shape)
 
         # Remove channel dim [B, 1, T] -> [B, T]
         return transformed_audio.squeeze(1)
@@ -931,16 +979,19 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         if not ignore_speech_gen and 'target_audio' in batch:
             assert batch["source_audio"].size(0) == batch["target_audio"].size(0)
             assert batch["target_first_turn_audio"].size(0) == batch["target_audio"].size(0)
+            
+        # r = dist.get_rank() if dist.is_initialized() else -1
+        # print(f"[DEBUG] entered train_step on rank={r}, LOCAL_RANK={os.environ.get('LOCAL_RANK')}")
+        # if r == 0:
+        #     import debugpy
+        #     debugpy.breakpoint()
 
         if self.cfg.get('use_old_noise_aug', None):
             # ToDo we are applying it in all datasets, old codebase does not applied in real conv data
             noise_prob = 0.99
             noise_min_snr = 20
             noise_max_snr = 50
-            noise_path = self.cfg.get(
-                'old_noise_aug_path',
-                None
-            )
+
             noise_path_name = "*"
             no_noise_audio = batch["source_audio"].clone()
             if (
@@ -962,12 +1013,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 )
         elif self.cfg.get('use_audio_aug', None):
             if self.training:
-                noise_path = self.cfg.get(
-                    'old_noise_aug_path',
-                    None
-                )
-                noise_files_paths = list(Path(noise_path).rglob("*.wav"))
-                augmented = self._build_audio_aug(audio_samples=batch["source_audio"], noise_files=noise_files_paths)
+                batch["source_audio"] = self._build_audio_aug(audio_samples=batch["source_audio"], noise_files=self.noise_files_paths)
 
         source_encoded, source_encoded_lens, asr_emb = self.perception(
             input_signal=batch["source_audio"],
@@ -2467,6 +2513,8 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 self.agent_film = fully_shard(self.agent_film, **fsdp_config)
                 if self.cfg.get("with_user_film_cond", None):
                     self.user_film = fully_shard(self.user_film, **fsdp_config)
+            if self.cfg.get("with_user_lstm_head", None):
+                self.user_lstm_head = fully_shard(self.user_lstm_head, **fsdp_config)
 
 
     def generate_silence_tokens(self, time_steps: int, num_codebooks: int) -> torch.Tensor:
@@ -2969,3 +3017,83 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             logging.info(f"Error loading model state_dict !! Retrying with partial initialization!")
             model_dict = set_model_dict_for_partial_init(state_dict, self.state_dict())
             super().load_state_dict(model_dict, strict=False)
+
+
+# TODO: move the following to data.utils
+
+def apply_eq(signal, eq, sampling_rate=16000, display=False):
+    """
+    Filter a signal with a low-pass/high-pass/band-pass/band-stop
+    Butterworth filter.
+
+    Parameters
+    ----------
+    signal: ndarray of floats (shape [n_channels, n_samples])
+        signal to filter
+
+    sampling_rate: int
+        sampling rate of the signal
+
+    eq: audio_dspy.eq.EQ
+        audio_dspy EQ instance containing filter parameters in .filters
+
+    display: bool (default False)
+        display input signal vs filtered signal
+
+    Returns
+    -------
+    ndarray of floats (shape [n_channels, n_samples])
+        filtered signal
+    """
+
+    # Apply filters
+    for filter in eq.filters:
+        filt_signal = filtfilt(
+            signal,
+            torch.from_numpy(filter.a_coefs).float().to(signal.device), 
+            torch.from_numpy(filter.b_coefs).float().to(signal.device) 
+        )
+
+    if torch.any(torch.isnan(filt_signal)):
+        raise ValueError('NaN found in filtered signal during EQ')
+
+    if filt_signal.dtype != signal.dtype:
+        filt_signal = filt_signal.astype(signal.dtype)
+
+    return filt_signal
+
+
+def get_random_eq(sampling_rate, display=False):
+  """Generate random EQ"""
+  eq = adsp.EQ(sampling_rate)
+
+  # Choose a filter type among low_shelf, bell, high_shelf
+  filter_type_choice = np.random.randint(3)
+
+  if filter_type_choice == 0:  # low_shelf
+    cutoff_freq = np.random.uniform(100, 400)
+    gain = np.random.uniform(1.05, 1.5)
+    q_factor = np.random.uniform(0.1, 0.8)
+    eq.add_lowshelf(cutoff_freq, q_factor, gain)
+
+  if filter_type_choice == 1:  # bell
+    # How many bands? 1 to 3
+    n_bands = np.random.randint(1, 4)
+    for sb in range(n_bands):
+      cutoff_freq = np.random.uniform(100, 6000)
+      gain = np.random.uniform(1.05, 1.5)
+      q_factor = np.random.uniform(0.1, 1)
+      eq.add_bell(cutoff_freq, q_factor, gain)
+
+  if filter_type_choice == 2:  # high_shelf
+    cutoff_freq = np.random.uniform(5000, 6000)
+    gain = np.random.uniform(1.05, 1.5)
+    q_factor = np.random.uniform(0.1, 0.8)
+    eq.add_highshelf(cutoff_freq, q_factor, gain)
+
+  if display:
+    plt.figure()
+    eq.plot_eq_curve()
+    plt.show(block=False)
+
+  return eq

@@ -701,7 +701,8 @@ class NeMoModelCheckpoint(ModelCheckpoint):
                 possible_marker_path = NeMoModelCheckpoint.format_checkpoint_unfinished_marker_path(ckpt_filepath)
                 if possible_marker_path in existing_marker_filepaths:
                     logging.warning(f'Removing unfinished checkpoint: {ckpt_filepath}')
-                    os.remove(ckpt_filepath)
+                    # os.remove(ckpt_filepath)
+                    remove_path(ckpt_filepath)
 
             # some directories might be distributed checkpoints, we remove these if they have a unfinished marker
             all_dirpaths = {d.resolve() for d in checkpoint_dir.glob("*") if d.is_dir()}
@@ -764,3 +765,12 @@ class NeMoModelCheckpoint(ModelCheckpoint):
             return f"{self.dirpath}/{ckpt_name}" if self.dirpath else ckpt_name
         else:
             return os.path.join(self.dirpath, ckpt_name) if self.dirpath else ckpt_name
+
+def remove_path(path):
+    p = Path(path)
+    if p.is_file() or p.is_symlink():
+        p.unlink()                # delete file
+    elif p.is_dir():
+        shutil.rmtree(p)          # delete directory (even if non-empty)
+    else:
+        raise FileNotFoundError(f"{path} does not exist")
