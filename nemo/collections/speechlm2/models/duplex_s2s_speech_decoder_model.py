@@ -20,12 +20,28 @@ import random
 import tempfile
 from pathlib import Path
 from collections import defaultdict
-from typing import Callable, Iterable, Optional, Tuple, List
+from typing import Callable, Iterable, Optional, Tuple, List, Union
 
+import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+
 import torchaudio
+from torch_audiomentations import (
+    Compose,
+    AddBackgroundNoise,
+    Gain,
+    # BandPassFilter,
+    LowPassFilter,
+    PitchShift,
+    # Shift,
+    # AddColoredNoise,
+    # PolarityInversion
+)
+from torchaudio.functional import filtfilt
+import audio_dspy as adsp
+
 from lightning import LightningModule
 from omegaconf import DictConfig, OmegaConf
 from peft import PeftModel
@@ -66,7 +82,7 @@ from nemo.collections.speechlm2.parts.pretrained import (
 from nemo.core.neural_types import AudioSignal, LabelsType, LengthsType, NeuralType
 from nemo.utils import logging
 
-
+    
 def delay_eos(tokens, eos_token_id, pad_token_id, shift=10):
     """
     Delays each EOS token by `shift` steps forward. Replaces original EOS with PAD.
@@ -253,6 +269,14 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         self.source_fps = self.source_sample_rate / (
             self.source_sample_rate * cfg.data.frame_length
         )  # conver frame rate in fps
+        
+        # Noise files for augmentation?
+        if False:  # self.cfg.get('use_audio_aug', None):
+            noise_path = self.cfg.get('old_noise_aug_path', None)
+            if noise_path is None:
+                raise ValueError("Noise file path cannot be None")
+            self.noise_files_paths = list(Path(noise_path).rglob("*.wav"))
+        self.noise_files_paths = None
 
         setup_audio_codec(self)
         self._codebook_size = self.audio_codec.vector_quantizer.codebook_size_per_group
@@ -823,6 +847,102 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
 
         return batch_audio
 
+
+    def _build_audio_aug(
+        self, 
+        audio_samples: torch.Tensor, 
+        noise_files: List[Union[str, Path]]
+    ) -> torch.Tensor:
+        """
+        Construct and apply an audio augmentation pipeline to the input batch.
+
+        Parameters
+        audio_samples : torch.Tensor
+            Input audio batch.
+        noise_files : List[str] or List[Path]
+            List of paths to WAV noise files that will be used by
+            AddBackgroundNoise.
+
+        Returns
+        torch.Tensor
+            Augmented audio batch, same shape as `audio_samples`.
+        """
+        # Ensure correct shape
+        if audio_samples.dim() == 2:            # [B, T]
+            audio_samples = audio_samples.unsqueeze(1)  # [B, 1, T]
+        elif audio_samples.dim() == 1:          # [T]
+            audio_samples = audio_samples.unsqueeze(0).unsqueeze(0)
+            
+        # TODO: add random seed control
+        
+        # Random EQ
+        if np.random.rand() > 0.1:
+            eq = get_random_eq(self.source_sample_rate)
+            with fp32_precision():
+                audio_samples = apply_eq(audio_samples, eq)
+
+        # Define augmentation
+        apply_augmentation = Compose(
+            transforms=[
+                # AddBackgroundNoise(
+                #     background_paths=[str(f) for f in noise_files],
+                #     min_snr_in_db=5,
+                #     max_snr_in_db=25,
+                #     p=0.8,
+                # ),
+                Gain(
+                    min_gain_in_db=-6,
+                    max_gain_in_db=6,
+                    p=0.8,
+                ),
+                PitchShift(
+                    min_transpose_semitones=-1.0,
+                    max_transpose_semitones=1.0,
+                    sample_rate=self.source_sample_rate,
+                    p=0.2,
+                ),
+                # Shift(
+                #     min_shift=-0.015,
+                #     max_shift=0.015,
+                #     shift_unit="seconds",
+                #     rollover=False,
+                #     p=0.3,
+                # ),
+                # BandPassFilter(
+                #     min_center_frequency=200,
+                #     max_center_frequency=4000,
+                #     min_bandwidth_fraction=0.5,
+                #     max_bandwidth_fraction=1.99,
+                #     p=0.7,
+                # ),
+                LowPassFilter(
+                    min_cutoff_freq=5000.0,
+                    max_cutoff_freq=7500.0,
+                    p=0.4
+                ),
+                # PolarityInversion(p=0.5),
+            ]
+        )
+
+        # Apply augmentation
+        with fp32_precision():
+            transformed_audio =  apply_augmentation(audio_samples, sample_rate=self.source_sample_rate)
+        
+
+        # If any sample's absolute peak > 1, rescale that sample so its peak becomes 0.85
+        # reduce over all non-batch dims (works for [B,T], [B,1,T], [B,C,T], etc.)
+        reduce_dims = tuple(range(1, transformed_audio.dim()))
+        max_abs = transformed_audio.abs().amax(dim=reduce_dims)  # shape: (B,)
+        eps = 1e-12
+        scale = torch.where(max_abs > 1.0, 0.85 / (max_abs + eps), torch.ones_like(max_abs))
+        # broadcast scale to audio shape
+        view_shape = [transformed_audio.shape[0]] + [1] * (transformed_audio.dim() - 1)
+        transformed_audio = transformed_audio * scale.view(*view_shape)
+
+        # Remove channel dim [B, 1, T] -> [B, T]
+        return transformed_audio.squeeze(1)
+
+
     def prepare_inputs(self, batch: dict):
         """
         Similar to DuplexS2SModel.prepare_inputs, with following changes:
@@ -842,10 +962,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             noise_prob = 0.99
             noise_min_snr = 20
             noise_max_snr = 50
-            noise_path = self.cfg.get(
-                'old_noise_aug_path',
-                None
-            )
+
             noise_path_name = "*"
             no_noise_audio = batch["source_audio"].clone()
             if (
@@ -866,34 +983,15 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                     noise_prob_low_pass=0.1,
                 )
         elif self.cfg.get('use_audio_aug', None):
-            # change audio volume randomly
-            if self.training and random.random() < self.cfg.get('noise_prob_scale_user', 0.0):
-                # prev codebase had 0.0631 and 5.6234 here we round the values
-                min_scale_val = self.cfg.get('noise_scale_user_min', 0.0631)  # -15 snr
-                max_scale_val = self.cfg.get('noise_scale_user_min', 5.6234)  # 24 snr
-
-                # get a random float value between min and max
-                scaling_factor = (
-                    torch.rand(batch["source_audio"].size(0), device=batch["source_audio"].device)
-                    * (max_scale_val - min_scale_val)
-                    + min_scale_val
-                )
-                batch["source_audio"] = batch["source_audio"] * scaling_factor.unsqueeze(-1)
-
-            # apply low pass filter
-            if self.training and random.random() < self.cfg.get('noise_prob_low_pass', 0.0):
-                # prev codebase had 0.0631 and 5.6234 here we round the values
-                cutoff_freq = self.cfg.get('noise_low_pass_cutoff_freq', 1000.0)
-                # note here we are using a biquad filter, older codebase we are using a filter of order 5
-                batch["source_audio"] = torchaudio.functional.lowpass_biquad(
-                    waveform=batch["source_audio"], sample_rate=self.source_sample_rate, cutoff_freq=cutoff_freq
-                )
+            if self.training:
+                batch["source_audio"] = self._build_audio_aug(audio_samples=batch["source_audio"], noise_files=self.noise_files_paths)
 
         source_encoded, source_encoded_lens, asr_emb = self.perception(
             input_signal=batch["source_audio"],
             input_signal_length=batch["source_audio_lens"],
             return_encoder_emb=True,
         )
+
 
         # zero-pad during system prompt : now done in loader
 
@@ -1124,6 +1222,12 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 device=self.device,
                 dtype=torch.bool,
             )
+            if self.cfg.get("do_user_asr", None):
+                user_seq_mask = torch.ones_like(
+                    user_text_labels.unsqueeze(-1),
+                    device=self.device,
+                    dtype=torch.bool,
+                )
         if self.cfg.get("mask_sequence_loss", True):
             # set the mask based on the target_token_lens to disconsider sequence padding in loss
             for i in range(batch["target_token_lens"].size(0)):
@@ -1132,6 +1236,15 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             # check new mask consistency
             mask_lengths = seq_mask[:, :, 0].sum(-1)
             assert torch.allclose(batch["target_token_lens"].float(), mask_lengths.float(), atol=2.0)
+            
+            if self.cfg.get("do_user_asr", None):
+                # set the mask based on the target_token_lens to disconsider sequence padding in loss
+                for i in range(batch["source_token_lens"].size(0)):
+                    speech_end_idx = batch["source_token_lens"][i]
+                    user_seq_mask[i, speech_end_idx:, :] = 0
+                # check new mask consistency
+                mask_lengths = user_seq_mask[:, :, 0].sum(-1)
+                assert torch.allclose(batch["source_token_lens"].float(), mask_lengths.float(), atol=4.0)
 
         # create loss scale mask by copying seq_mask to include mask sequence
         loss_scale = seq_mask.clone().float()
@@ -1143,26 +1256,41 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             )
         if self.use_word_pad and self.cfg.get("scale_word_pad_loss_by", 1.) != 1:
             loss_scale[:, :, :1] = torch.where(
-                text_labels.unsqueeze(-1) == self.word_pad_id[0],
+                (text_labels.unsqueeze(-1) == self.word_pad_id[0]) | (text_labels.unsqueeze(-1) == self.word_epad_id[0]),
                 float(self.cfg.get("scale_word_pad_loss_by")),
                 loss_scale[:, :, :1]
             )
             
         user_loss_scale = None
         if self.cfg.get("do_user_asr", None):
-            user_loss_scale = source_activity.clone().float()
+            user_loss_scale = user_seq_mask.clone().float()
             if self.cfg.get("scale_loss_by") == 'non_sil_t':
-                user_loss_scale = torch.where(
-                    user_text_labels != self.text_pad_id,
+                user_loss_scale[:, :, :1] = torch.where(
+                    user_text_labels.unsqueeze(-1) != self.text_pad_id,
                     self.cfg.get("scale_loss_mask", self.cfg.get("nonsil_weight", 4.0)),
-                    user_loss_scale,
-                ) # type: ignore
-            if self.use_word_pad and self.cfg.get("scale_word_pad_loss_by", 1.) != 1:
-                user_loss_scale = torch.where(
-                    user_text_labels== self.word_pad_id[0],
-                    self.cfg.get("scale_word_pad_loss_by"),
-                    user_loss_scale
+                    user_loss_scale[:, :, :1],
                 )
+            if self.use_word_pad and self.cfg.get("scale_word_pad_loss_by", 1.) != 1:
+                user_loss_scale[:, :, :1] = torch.where(
+                    (user_text_labels.unsqueeze(-1) == self.word_pad_id[0]) | (user_text_labels.unsqueeze(-1) == self.word_epad_id[0]),
+                    float(self.cfg.get("scale_word_pad_loss_by")),
+                    user_loss_scale[:, :, :1]
+                )
+            # The following is not OK is the loss is 0 every time the user is inactive, contrary to above,
+            # where it is lower but not zero
+            # user_loss_scale = source_activity.clone().float()
+            # if self.cfg.get("scale_loss_by") == 'non_sil_t':
+            #     user_loss_scale = torch.where(
+            #         user_text_labels != self.text_pad_id,
+            #         self.cfg.get("scale_loss_mask", self.cfg.get("nonsil_weight", 4.0)),
+            #         user_loss_scale,
+            #     ) # type: ignore
+            # if self.use_word_pad and self.cfg.get("scale_word_pad_loss_by", 1.) != 1:
+            #     user_loss_scale = torch.where(
+            #         user_text_labels == self.word_pad_id[0],
+            #         self.cfg.get("scale_word_pad_loss_by"),
+            #         user_loss_scale
+            #     )
 
         # debug samples:
         if (
@@ -1472,7 +1600,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                         )
                         
                         user_text_loss = (
-                            user_ce * inputs["user_loss_scale"].flatten(0, 1)
+                            user_ce * inputs["user_loss_scale"][:, :, 0].flatten(0, 1)
                         ).sum(-1) / num_user_frames
 
                         num_eos = torch.count_nonzero(user_eos_mask)
@@ -1496,7 +1624,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                     text_loss = (
                         agent_text_loss + agent_eos_loss * loss_w[0] + agent_bos_loss * loss_w[1] +
                         loss_w[2] * user_text_loss + user_eos_loss * loss_w[3] + user_bos_loss * loss_w[4]
-                    ) / 100  # 1000  TODO: move scale (100) to config
+                    ) / 100  #  TODO: move scale (100) to config
                 else:
                     text_logits = forward_outputs["text_logits"]
                     # mask text logits to ignore sequence padding
