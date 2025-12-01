@@ -346,6 +346,20 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 z_dim = 128  # TODO: add to config and test larger values
                 # z_dim = 512
             )
+            if self.cfg.get("with_user_film_cond", None):
+                self.user_film = FiLMConditioner(
+                    hidden_size,
+                    hidden_size,
+                    # llm.config.vocab_size,
+                    z_dim = 128  # TODO: add to config and test larger values
+                    # z_dim = 512
+                )
+            if self.cfg.get("with_user_lstm_head", None):
+                self.user_lstm_head = torch.nn.LSTM(
+                    hidden_size, 
+                    hidden_size,
+                    batch_first=True                    
+                )
             
         # r = dist.get_rank() if dist.is_initialized() else -1
         # print(f"[DEBUG] entered train_step on rank={r}, LOCAL_RANK={os.environ.get('LOCAL_RANK')}")
@@ -615,6 +629,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         asr_emb=None,
         speaker_encoder_emb=None,
         llm_kwargs={},
+        user_lstm_states=None
     ) -> dict[str, Tensor]:
         """
         Separated text and speech prediction:
@@ -653,7 +668,15 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             agent_gated_hidden = self.agent_film(x, cond_embed)
             text_logits = self.lm_head(agent_gated_hidden)  # (B, T, text_vocab_size)
             
-            user_text_logits = self.lm_head(x)  # (B, T, text_vocab_size)
+            if self.cfg.get("with_user_film_cond", None):
+                user_gated_hidden = self.user_film(x, cond_embed)
+                if self.cfg.get("with_user_lstm_head", None):
+                    user_gated_hidden, user_lstm_states = self.user_lstm_head(user_gated_hidden, user_lstm_states)
+                user_text_logits = self.lm_head(user_gated_hidden)  # (B, T, text_vocab_size)
+            else:
+                if self.cfg.get("with_user_lstm_head", None):
+                    x, user_lstm_states = self.user_lstm_head(x, user_lstm_states)
+                user_text_logits = self.lm_head(x)  # (B, T, text_vocab_size)
 
         else:
             text_logits = self.lm_head(out['last_hidden_state'])  # (B, T, text_vocab_size)
@@ -730,6 +753,9 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         }
         if self.cfg.get("do_user_asr", None):
             ans["user_text_logits"] = user_text_logits
+        
+        if self.cfg.get("with_user_lstm_head", None):
+            ans["user_lstm_states"] = user_lstm_states
         
         if cache is not None:
             ans["cache"] = out[cache_key]
@@ -1438,11 +1464,15 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
 
     def training_step(self, batch: dict, batch_idx: int):
         ignore_speech_gen = self.cfg.get("ignore_speech_gen", None)
+        
+        modules = [self.perception.preprocessor, self.perception.encoder,
+            self.llm, self.lm_head, self.embed_tokens]
+        if self.cfg.get("use_film_cond", None):
+            modules.append(self.agent_film)
+            if self.cfg.get("with_user_film_cond", None):
+                modules.append(self.user_film)
 
-        for m in (
-            self.perception.preprocessor, self.perception.encoder,
-            self.llm, self.lm_head, self.embed_tokens, self.agent_film
-        ):
+        for m in modules:
             if self.cfg.get(
                 "tokenizer", None
                 ) and self.cfg.tokenizer.get("train_new_embeddings", None) and m is self.embed_tokens:
@@ -2594,6 +2624,10 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 self.speech_generation = fully_shard(self.speech_generation, **fsdp_config)
             if self.cfg.get("use_film_cond", None):
                 self.agent_film = fully_shard(self.agent_film, **fsdp_config)
+                if self.cfg.get("with_user_film_cond", None):
+                    self.user_film = fully_shard(self.user_film, **fsdp_config)
+            if self.cfg.get("with_user_lstm_head", None):
+                self.user_lstm_head = fully_shard(self.user_lstm_head, **fsdp_config)
 
 
     def generate_silence_tokens(self, time_steps: int, num_codebooks: int) -> torch.Tensor:
@@ -3096,3 +3130,83 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             logging.info(f"Error loading model state_dict !! Retrying with partial initialization!")
             model_dict = set_model_dict_for_partial_init(state_dict, self.state_dict())
             super().load_state_dict(model_dict, strict=False)
+
+
+# TODO: move the following to data.utils
+
+def apply_eq(signal, eq, sampling_rate=16000, display=False):
+    """
+    Filter a signal with a low-pass/high-pass/band-pass/band-stop
+    Butterworth filter.
+
+    Parameters
+    ----------
+    signal: ndarray of floats (shape [n_channels, n_samples])
+        signal to filter
+
+    sampling_rate: int
+        sampling rate of the signal
+
+    eq: audio_dspy.eq.EQ
+        audio_dspy EQ instance containing filter parameters in .filters
+
+    display: bool (default False)
+        display input signal vs filtered signal
+
+    Returns
+    -------
+    ndarray of floats (shape [n_channels, n_samples])
+        filtered signal
+    """
+
+    # Apply filters
+    for filter in eq.filters:
+        filt_signal = filtfilt(
+            signal,
+            torch.from_numpy(filter.a_coefs).float().to(signal.device), 
+            torch.from_numpy(filter.b_coefs).float().to(signal.device) 
+        )
+
+    if torch.any(torch.isnan(filt_signal)):
+        raise ValueError('NaN found in filtered signal during EQ')
+
+    if filt_signal.dtype != signal.dtype:
+        filt_signal = filt_signal.astype(signal.dtype)
+
+    return filt_signal
+
+
+def get_random_eq(sampling_rate, display=False):
+  """Generate random EQ"""
+  eq = adsp.EQ(sampling_rate)
+
+  # Choose a filter type among low_shelf, bell, high_shelf
+  filter_type_choice = np.random.randint(3)
+
+  if filter_type_choice == 0:  # low_shelf
+    cutoff_freq = np.random.uniform(100, 400)
+    gain = np.random.uniform(1.05, 1.5)
+    q_factor = np.random.uniform(0.1, 0.8)
+    eq.add_lowshelf(cutoff_freq, q_factor, gain)
+
+  if filter_type_choice == 1:  # bell
+    # How many bands? 1 to 3
+    n_bands = np.random.randint(1, 4)
+    for sb in range(n_bands):
+      cutoff_freq = np.random.uniform(100, 6000)
+      gain = np.random.uniform(1.05, 1.5)
+      q_factor = np.random.uniform(0.1, 1)
+      eq.add_bell(cutoff_freq, q_factor, gain)
+
+  if filter_type_choice == 2:  # high_shelf
+    cutoff_freq = np.random.uniform(5000, 6000)
+    gain = np.random.uniform(1.05, 1.5)
+    q_factor = np.random.uniform(0.1, 0.8)
+    eq.add_highshelf(cutoff_freq, q_factor, gain)
+
+  if display:
+    plt.figure()
+    eq.plot_eq_curve()
+    plt.show(block=False)
+
+  return eq
