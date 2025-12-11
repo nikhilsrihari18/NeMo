@@ -95,7 +95,7 @@ def inference(cfg):
         # Check if we want to merge LoRA weights
         lora_init_merge = cfg.model.get("lora_init_merge", False)        
 
-        if cfg.model.get("pretrained_s2s_train_ckpt", None):
+        if False:  # cfg.model.get("pretrained_s2s_train_ckpt", None):
             if (Path(cfg.exp_manager.explicit_log_dir) / 'checkpoints').exists():
                 # using_s2s_train_ckpt = False
                 logging.info("Intermediate checkpoints found in exp dir. We won't restore training ckpt from pretrained_s2s_train_ckpt...") 
