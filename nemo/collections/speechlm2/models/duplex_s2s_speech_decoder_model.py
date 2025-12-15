@@ -2060,10 +2060,10 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                     dataset_batch["instructions_len"],
                 )
             else:
-                # results = self.offline_inference(
-                #     dataset_batch["source_audio"],
-                #     dataset_batch["source_audio_lens"],
-                # )
+                results = self.offline_inference(
+                    dataset_batch["source_audio"],
+                    dataset_batch["source_audio_lens"],
+                )
                 
                 # r = dist.get_rank() if dist.is_initialized() else -1
                 # print(f"[DEBUG] entered train_step on rank={r}, LOCAL_RANK={os.environ.get('LOCAL_RANK')}")
@@ -2072,39 +2072,39 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 #     debugpy.breakpoint()
                 
                 # !!!! DEBUGGING !!!!
-                inputs = self.prepare_inputs(dataset_batch)
-                forward_outputs = self(
-                    inputs["input_embeds"],
-                    input_audio_tokens=None,
-                    seq_mask=inputs["seq_mask"],
-                    target_text_tokens=inputs["text_labels"],
-                    modality_adapter_emb=inputs["perception_emb"],
-                    asr_emb=inputs["asr_emb"],
-                    speaker_encoder_emb=inputs["speaker_encoder_emb"],
-                )
+                # inputs = self.prepare_inputs(dataset_batch)
+                # forward_outputs = self(
+                #     inputs["input_embeds"],
+                #     input_audio_tokens=None,
+                #     seq_mask=inputs["seq_mask"],
+                #     target_text_tokens=inputs["text_labels"],
+                #     modality_adapter_emb=inputs["perception_emb"],
+                #     asr_emb=inputs["asr_emb"],
+                #     speaker_encoder_emb=inputs["speaker_encoder_emb"],
+                # )
                 
-                text_logits = forward_outputs["text_logits"]
-                pred_tokens = text_logits.argmax(dim=-1)
-                agent_text = tokens_to_text(pred_tokens, tokenizer=self.tokenizer.tokenizer, text_only=True)
+                # text_logits = forward_outputs["text_logits"]
+                # pred_tokens = text_logits.argmax(dim=-1)
+                # agent_text = tokens_to_text(pred_tokens, tokenizer=self.tokenizer.tokenizer, text_only=True)
                 
-                user_text_logits = forward_outputs["user_text_logits"]
-                user_pred_tokens = user_text_logits.argmax(dim=-1)
-                user_text = tokens_to_text(
-                    user_pred_tokens, tokenizer=self.tokenizer.tokenizer, text_only=True
-                )
-                user_text_with_special = tokens_to_str(
-                    user_pred_tokens, inputs["input_lens"], tokenizer=self.tokenizer, pad_id=self.text_pad_id
-                )
-                results = {
-                    "text_with_special_tokens": tokens_to_str(pred_tokens, inputs["output_lens"], tokenizer=self.tokenizer, pad_id=self.text_pad_id),
-                    "text": agent_text,
-                    "tokens_text": pred_tokens,
-                    "tokens_audio": None,
-                    "tokens_len": inputs["output_lens"],
-                    "user_text_with_special_tokens": user_text_with_special,
-                    "user_text":user_text,
-                    "audio": None
-                }
+                # user_text_logits = forward_outputs["user_text_logits"]
+                # user_pred_tokens = user_text_logits.argmax(dim=-1)
+                # user_text = tokens_to_text(
+                #     user_pred_tokens, tokenizer=self.tokenizer.tokenizer, text_only=True
+                # )
+                # user_text_with_special = tokens_to_str(
+                #     user_pred_tokens, inputs["input_lens"], tokenizer=self.tokenizer, pad_id=self.text_pad_id
+                # )
+                # results = {
+                #     "text_with_special_tokens": tokens_to_str(pred_tokens, inputs["output_lens"], tokenizer=self.tokenizer, pad_id=self.text_pad_id),
+                #     "text": agent_text,
+                #     "tokens_text": pred_tokens,
+                #     "tokens_audio": None,
+                #     "tokens_len": inputs["output_lens"],
+                #     "user_text_with_special_tokens": user_text_with_special,
+                #     "user_text":user_text,
+                #     "audio": None
+                # }
                 
                 # dist.barrier()
 
@@ -2326,7 +2326,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         # -- First step, use init tokens  -------
         if self.system_prompt is not None or self.use_chat_template:
             init_seq = self._get_bos_embedding()
-            input_embeds[:, :init_seq.shape[0]] = init_seq
+            input_embeds[:, :init_seq.shape[0], :] = init_seq
         else:
             # input_embeds[:, 0] += self._get_bos_embedding()
             input_embeds[:, 0] = self._get_bos_embedding()  # Note: overwriting instead of adding in orig solution
@@ -2359,7 +2359,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
 
         step_asr_emb = None if asr_emb is None else asr_emb[:, :1]
         ans = self(
-            input_embeds[:, :1],
+            input_embeds[:, :1, :],
             cache=cache,
             input_audio_tokens=first_audio,
             seq_mask=None,
